@@ -7,7 +7,8 @@ struct bar {
   bool shown;
   bool hidden;
   bool mouse_over;
-
+  bool expanded;
+  int expand_progress;
   uint32_t sid;
   uint32_t dsid;
   uint32_t did;
@@ -26,5 +27,6 @@ void bar_draw(struct bar* bar, bool forced);
 void bar_order_item_windows(struct bar* bar);
 
 bool bar_draws_item(struct bar* bar, struct bar_item* bar_item);
+bool bar_set_expand_progress(void* target, int progress);
 
 void bar_change_space(struct bar* bar, uint64_t dsid);

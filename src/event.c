@@ -2,6 +2,7 @@
 #include "bar_manager.h"
 #include "custom_events.h"
 #include "hotload.h"
+#include "animation.h"
 
 extern struct bar_manager g_bar_manager;
 extern int g_connection;
@@ -87,6 +88,30 @@ static void event_mouse_up(void* context) {
 
   struct bar* bar = bar_manager_get_bar_by_wid(&g_bar_manager, wid);
   struct popup* popup = bar_manager_get_popup_by_wid(&g_bar_manager, wid);
+  
+  struct bar* click_bar = bar ? bar : bar_manager_get_bar_by_point(&g_bar_manager, point);
+  if (click_bar) {
+    click_bar->expanded = !click_bar->expanded;
+    bool needs_refresh = false;
+    
+    uint32_t current_duration = g_bar_manager.animator.duration;
+    char current_interp = g_bar_manager.animator.interp_function;
+    
+    g_bar_manager.animator.duration = 40;
+    g_bar_manager.animator.interp_function = INTERP_FUNCTION_SIN;
+    
+    int t = click_bar->expanded ? 1000 : 0;
+    ANIMATE(bar_set_expand_progress, click_bar, click_bar->expand_progress, t);
+    
+    g_bar_manager.animator.duration = current_duration;
+    g_bar_manager.animator.interp_function = current_interp;
+
+    if (needs_refresh) {
+      g_bar_manager.bar_needs_update = true;
+      bar_manager_refresh(&g_bar_manager, false, false);
+    }
+  }
+
   if (!bar_item && !popup && !bar) return;
 
   CGPoint point_in_window_coords = CGPointZero;

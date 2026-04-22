@@ -233,7 +233,7 @@ static void bar_calculate_bounds_top_bottom(struct bar* bar) {
                                            - notch_width) / 2;
 
   uint32_t* next_position = NULL;
-  uint32_t y = bar->window.frame.size.height / 2;
+  uint32_t y = g_bar_manager.background.bounds.size.height / 2;
 
   for (int i = 0; i < g_bar_manager.bar_item_count; i++) {
     struct bar_item* bar_item = g_bar_manager.bar_items[i];
@@ -275,7 +275,7 @@ static void bar_calculate_bounds_top_bottom(struct bar* bar) {
 
     CGPoint shadow_offsets = bar_item_calculate_shadow_offsets(bar_item);
     uint32_t bar_item_length = bar_item_calculate_bounds(bar_item,
-                                 bar->window.frame.size.height
+                                 g_bar_manager.background.bounds.size.height
                                  - (g_bar_manager.background.border_width + 1),
                                  max(shadow_offsets.x, 0),
                                  y                                           );
@@ -480,13 +480,19 @@ static CGRect bar_get_frame(struct bar *bar) {
   } else {
     bounds.size.width -= 2*g_bar_manager.margin;
     CGPoint origin = bounds.origin;
+    
+    int progress = bar->expand_progress;
+    int h = g_bar_manager.background.bounds.size.height + (400 - g_bar_manager.background.bounds.size.height) * progress / 1000;
+    int w = 218 + (400 - 218) * progress / 1000;
+    origin.x = bounds.size.width / 2 - (w / 2);
+
     origin.x += g_bar_manager.margin;
     origin.y += g_bar_manager.background.y_offset + notch_offset;
-
+    bounds.size.width = w;
 
     if (g_bar_manager.position == POSITION_BOTTOM) {
       origin.y = CGRectGetMaxY(bounds)
-                 - g_bar_manager.background.bounds.size.height
+                 - h
                  - 2*(g_bar_manager.background.y_offset) - notch_offset;
     } else if (display_menu_bar_visible() && !g_bar_manager.topmost) {
       CGRect menu = display_menu_bar_rect(bar->did);
@@ -494,7 +500,11 @@ static CGRect bar_get_frame(struct bar *bar) {
     }
 
 
-    if (notch_display_height > 0) {
+    if (progress > 0) {
+      return (CGRect) {{origin.x, origin.y},
+                        {bounds.size.width,
+                        h}};
+    } else if (notch_display_height > 0) {
       return (CGRect) {{origin.x, origin.y},
                         {bounds.size.width,
                         g_bar_manager.notch_display_height}};
@@ -502,7 +512,7 @@ static CGRect bar_get_frame(struct bar *bar) {
     
     return (CGRect) {{origin.x, origin.y},
                       {bounds.size.width,
-                      g_bar_manager.background.bounds.size.height}};
+                      h}};
   }
 }
 
@@ -516,6 +526,14 @@ void bar_resize(struct bar* bar) {
     window_assign_mouse_tracking_area(&bar->window, bar->window.frame);
     g_bar_manager.bar_needs_update = true;
   }
+}
+
+bool bar_set_expand_progress(void* target, int progress) {
+  struct bar* bar = target;
+  if (bar->expand_progress == progress) return false;
+  bar->expand_progress = progress;
+  bar_resize(bar);
+  return true;
 }
 
 void bar_set_hidden(struct bar* bar, bool hidden) {
