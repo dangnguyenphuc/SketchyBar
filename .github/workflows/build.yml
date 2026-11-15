@@ -1,0 +1,55 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Release build (macOS arm64)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain info
+        run: |
+          sw_vers
+          xcode-select -p
+          cc --version
+
+      - name: Build
+        run: make all
+
+      - name: Verify binary
+        run: |
+          lipo -archs bin/sketchybar
+          lipo -archs bin/sketchybar | grep -qw arm64
+          ./bin/sketchybar --version
+
+      - name: Package
+        run: |
+          VERSION="$(./bin/sketchybar --version)"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          mkdir -p dist
+          cp bin/sketchybar dist/
+          tar -czf "dist/$VERSION-macos-arm64.tar.gz" -C bin sketchybar
+          shasum -a 256 dist/*.tar.gz | tee dist/SHA256SUMS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.VERSION }}-macos-arm64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

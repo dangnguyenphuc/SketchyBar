@@ -4,6 +4,7 @@
 #include "display.h"
 #include "misc/helpers.h"
 #include "window.h"
+#include "mouse.h"
 
 extern int workspace_display_notch_height(uint32_t did);
 
@@ -148,6 +149,241 @@ static void bar_check_for_clip_updates(struct bar* bar) {
   }
 }
 
+static bool bar_is_horizontal() {
+  return g_bar_manager.position != POSITION_LEFT
+         && g_bar_manager.position != POSITION_RIGHT;
+}
+
+static double bar_collapsed_height(struct bar* bar) {
+  if (workspace_display_notch_height(bar->did) > 0
+      && g_bar_manager.notch_display_height > 0  )
+    return g_bar_manager.notch_display_height;
+  return g_bar_manager.background.bounds.size.height;
+}
+
+// Size of the visible notch shape for a given expand progress.
+static CGSize bar_get_shape_size(struct bar* bar, int progress) {
+  double t = (double)progress / BAR_EXPAND_PROGRESS_MAX;
+  if (t < 0.0) t = 0.0;
+  if (t > 1.0) t = 1.0;
+
+  double collapsed_height = bar_collapsed_height(bar);
+  return (CGSize){
+    round(BAR_NOTCH_COLLAPSED_WIDTH
+          + (BAR_NOTCH_EXPANDED_WIDTH - BAR_NOTCH_COLLAPSED_WIDTH) * t),
+    round(collapsed_height
+          + (BAR_NOTCH_EXPANDED_HEIGHT - collapsed_height) * t)
+  };
+}
+
+// While expanded or animating, the window keeps the full expanded size and
+// only the drawn shape changes. Resizing the window on every animation frame
+// is not atomic with the redraw, which made the shape jitter on the y-axis.
+static bool bar_uses_expanded_window(struct bar* bar) {
+  return bar->expanded || bar->expand_progress > 0;
+}
+
+// Rect of the visible shape inside the window (CG coordinates, y-up). It is
+// centered horizontally and pinned to the screen edge the bar is attached to,
+// so its top (or bottom) edge never moves during the animation.
+static CGRect bar_get_shape_bounds(struct bar* bar) {
+  CGRect frame = bar->window.frame;
+  if (!bar_is_horizontal()) return frame;
+
+  CGSize size = bar_get_shape_size(bar, bar->expand_progress);
+  if (size.width > frame.size.width) size.width = frame.size.width;
+  if (size.height > frame.size.height) size.height = frame.size.height;
+
+  frame.origin.x = round((frame.size.width - size.width) / 2.0);
+  frame.origin.y = g_bar_manager.position == POSITION_BOTTOM
+                   ? 0
+                   : frame.size.height - size.height;
+  frame.size = size;
+  return frame;
+}
+
+// Area of the expanded island below the notch band (window-local, y-up).
+static CGRect bar_get_island_panel(struct bar* bar) {
+  CGSize size = bar->window.frame.size;
+  double band = bar_collapsed_height(bar);
+  return (CGRect){{ 0, g_bar_manager.position == POSITION_BOTTOM ? band : 0 },
+                  { size.width, size.height - band                          }};
+}
+
+// Converts a global (y-down) event location into window-local (y-up) coords.
+static CGPoint bar_get_local_point(struct bar* bar, CGPoint point) {
+  return (CGPoint){ point.x - bar->window.origin.x,
+                    bar->window.frame.size.height
+                    - (point.y - bar->window.origin.y) };
+}
+
+static bool bar_shows_island(struct bar* bar) {
+  return bar_is_horizontal() && bar->expanded && bar->expand_progress > 0;
+}
+
+// One frame of the mouse wheel glide: moves scroll_offset a time-based
+// fraction of the way to scroll_target. Called by a "driver" animation that
+// only supplies display frames; its interpolated value is ignored. So a new
+// wheel tick just moves the target and restarts the driver, and the glide
+// continues seamlessly instead of starting over from a standstill.
+static bool bar_step_island_scroll(void* target, int value) {
+  struct bar* bar = target;
+  struct island* island = &bar->island;
+
+  uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  double dt = (double)(now - bar->scroll_glide_time) / 1e9;
+  // The first frame of a glide (or one after a stall) steps one 60Hz frame.
+  if (!bar->scroll_glide_time || dt <= 0 || dt > 0.05) dt = 1.0 / 60.0;
+  bar->scroll_glide_time = now;
+
+  CGFloat remaining = island->scroll_target - island->scroll_offset;
+  if (remaining == 0) return false;
+
+  if (fabs(remaining) < 0.25) {
+    island->scroll_offset = island->scroll_target;
+  } else {
+    island->scroll_offset += remaining
+                             * (1.0 - exp(-dt / BAR_SCROLL_WHEEL_TAU));
+  }
+  return true;
+}
+
+static void bar_cancel_island_scroll(struct bar* bar) {
+  animator_cancel_locked(&g_bar_manager.animator,
+                         bar,
+                         (animator_function*)bar_step_island_scroll);
+  bar->scroll_glide_time = 0;
+}
+
+static void bar_glide_island_scroll(struct bar* bar) {
+  // Restarting the driver keeps scroll_glide_time, so the step size stays
+  // continuous across wheel ticks.
+  uint64_t glide_time = bar->scroll_glide_time;
+  bar_cancel_island_scroll(bar);
+  bar->scroll_glide_time = glide_time;
+  if (bar->island.scroll_offset == bar->island.scroll_target) return;
+
+  bool needs_refresh = false;
+  uint32_t saved_duration = g_bar_manager.animator.duration;
+  char saved_interp = g_bar_manager.animator.interp_function;
+  g_bar_manager.animator.duration = BAR_SCROLL_GLIDE_FRAMES;
+  g_bar_manager.animator.interp_function = INTERP_FUNCTION_LINEAR;
+
+  ANIMATE(bar_step_island_scroll, bar, 0, 1);
+  animator_lock(&g_bar_manager.animator);
+
+  g_bar_manager.animator.duration = saved_duration;
+  g_bar_manager.animator.interp_function = saved_interp;
+  (void)needs_refresh;
+}
+
+static bool bar_set_island_transition(void* target, int value) {
+  struct bar* bar = target;
+  double transition = (double)value / BAR_EXPAND_PROGRESS_MAX;
+  if (bar->island.transition == transition) return false;
+  bar->island.transition = transition;
+  return true;
+}
+
+static void bar_cancel_island_transition(struct bar* bar) {
+  animator_cancel_locked(&g_bar_manager.animator,
+                         bar,
+                         (animator_function*)bar_set_island_transition);
+}
+
+static void bar_animate_island_transition(struct bar* bar) {
+  bar_cancel_island_transition(bar);
+
+  bool needs_refresh = false;
+  uint32_t saved_duration = g_bar_manager.animator.duration;
+  char saved_interp = g_bar_manager.animator.interp_function;
+  g_bar_manager.animator.duration = BAR_PAGE_DURATION;
+  g_bar_manager.animator.interp_function = INTERP_FUNCTION_SIN;
+
+  ANIMATE(bar_set_island_transition, bar, 0, BAR_EXPAND_PROGRESS_MAX);
+  animator_lock(&g_bar_manager.animator);
+
+  g_bar_manager.animator.duration = saved_duration;
+  g_bar_manager.animator.interp_function = saved_interp;
+  (void)needs_refresh;
+}
+
+bool bar_contains_point(struct bar* bar, CGPoint point) {
+  CGRect frame = bar->window.frame;
+  frame.origin = bar->window.origin;
+  return CGRectContainsPoint(frame, point);
+}
+
+bool bar_island_click(struct bar* bar, CGPoint point) {
+  if (!bar_shows_island(bar)) return false;
+  // A service switch resets the scroll position; a still running scroll
+  // animation must not move it again.
+  bar_cancel_island_scroll(bar);
+  bar->island.scroll_target = bar->island.scroll_offset;
+
+  int service = bar->island.service;
+  if (!island_handle_click(&bar->island,
+                           bar_get_island_panel(bar),
+                           bar_get_local_point(bar, point))) {
+    return false;
+  }
+
+  if (bar->island.service != service) bar_animate_island_transition(bar);
+  g_bar_manager.bar_needs_update = true;
+  return true;
+}
+
+// `delta` is in points (positive scrolls towards the top of the list).
+bool bar_island_scroll(struct bar* bar,
+                       CGPoint point,
+                       CGFloat delta,
+                       bool continuous) {
+  if (!bar_shows_island(bar)) return false;
+  if (!island_handle_scroll(&bar->island,
+                            bar_get_island_panel(bar),
+                            bar_get_local_point(bar, point),
+                            delta                           )) {
+    return false;
+  }
+
+  if (continuous) {
+    // Trackpad events already arrive at about the display rate: apply them
+    // right away and redraw now (the caller refreshes), no added latency.
+    bar_cancel_island_scroll(bar);
+    if (bar->island.scroll_offset != bar->island.scroll_target) {
+      bar->island.scroll_offset = bar->island.scroll_target;
+      g_bar_manager.bar_needs_update = true;
+    }
+  } else {
+    bar_glide_island_scroll(bar);
+  }
+  return true;
+}
+
+// Island content (fonts, notification data) is only kept while at least one
+// island is open or animating.
+static void bar_release_island_if_idle() {
+  for (int i = 0; i < g_bar_manager.bar_count; i++) {
+    struct bar* bar = g_bar_manager.bars[i];
+    if (bar && (bar->expanded || bar->expand_progress > 0)) return;
+  }
+  island_release();
+}
+
+// The shape drawn into the window: the visible shape stretched past the
+// screen edge the bar is attached to by the corner radius. Those corners then
+// lie outside the window and get cut off, so only the free side is rounded,
+// like the hardware notch.
+static CGRect bar_get_drawn_shape(struct bar* bar) {
+  CGRect shape = bar_get_shape_bounds(bar);
+  if (!bar_is_horizontal()) return shape;
+
+  double radius = g_bar_manager.background.corner_radius;
+  shape.size.height += radius;
+  if (g_bar_manager.position == POSITION_BOTTOM) shape.origin.y -= radius;
+  return shape;
+}
+
 void bar_draw(struct bar* bar, bool forced) {
   if (bar->sid < 1 || bar->adid < 1) return;
 
@@ -156,12 +392,22 @@ void bar_draw(struct bar* bar, bool forced) {
 
   if (g_bar_manager.bar_needs_update) {
     struct background background = g_bar_manager.background;
-    background.bounds = bar->window.frame;
+    background.bounds = bar_get_drawn_shape(bar);
     background.bounds.origin.y -= background.y_offset;
     background.shadow.enabled = false;
     background.enabled = true;
+    windows_freeze();
     CGContextClearRect(bar->window.surface->context, bar->window.frame);
     background_draw(&background, bar->window.surface->context);
+
+    if (bar_is_horizontal() && bar->expand_progress > 0) {
+      island_draw(&bar->island,
+                  bar->window.surface->context,
+                  bar_get_island_panel(bar),
+                  bar_get_drawn_shape(bar),
+                  g_bar_manager.background.corner_radius,
+                  (double)bar->expand_progress / BAR_EXPAND_PROGRESS_MAX);
+    }
   }
 
   for (int i = 0; i < g_bar_manager.bar_item_count; i++) {
@@ -448,9 +694,6 @@ void bar_calculate_bounds(struct bar* bar) {
 static CGRect bar_get_frame(struct bar *bar) {
   bool has_notch = workspace_display_notch_height(bar->did) > 0;
   int notch_offset = has_notch ? g_bar_manager.notch_offset : 0;
-  int notch_display_height = has_notch
-                             ? g_bar_manager.notch_display_height
-                             : 0;
 
 
   CGRect bounds = display_bounds(bar->did);
@@ -478,41 +721,26 @@ static CGRect bar_get_frame(struct bar *bar) {
                      {g_bar_manager.background.bounds.size.height,
                       bounds.size.height                          }};
   } else {
-    bounds.size.width -= 2*g_bar_manager.margin;
-    CGPoint origin = bounds.origin;
-    
-    int progress = bar->expand_progress;
-    int h = g_bar_manager.background.bounds.size.height + (400 - g_bar_manager.background.bounds.size.height) * progress / 1000;
-    int w = 218 + (400 - 218) * progress / 1000;
-    origin.x = bounds.size.width / 2 - (w / 2);
+    CGSize size = bar_get_shape_size(bar, bar_uses_expanded_window(bar)
+                                          ? BAR_EXPAND_PROGRESS_MAX
+                                          : 0                       );
 
-    origin.x += g_bar_manager.margin;
-    origin.y += g_bar_manager.background.y_offset + notch_offset;
-    bounds.size.width = w;
+    // Centered on the display (keeps the display's own x origin, so this also
+    // works on secondary monitors).
+    origin.x = bounds.origin.x + round((bounds.size.width - size.width) / 2.0);
+    origin.y = bounds.origin.y + g_bar_manager.background.y_offset
+                               + notch_offset;
 
     if (g_bar_manager.position == POSITION_BOTTOM) {
       origin.y = CGRectGetMaxY(bounds)
-                 - h
+                 - size.height
                  - 2*(g_bar_manager.background.y_offset) - notch_offset;
     } else if (display_menu_bar_visible() && !g_bar_manager.topmost) {
       CGRect menu = display_menu_bar_rect(bar->did);
       origin.y += menu.size.height;
     }
 
-
-    if (progress > 0) {
-      return (CGRect) {{origin.x, origin.y},
-                        {bounds.size.width,
-                        h}};
-    } else if (notch_display_height > 0) {
-      return (CGRect) {{origin.x, origin.y},
-                        {bounds.size.width,
-                        g_bar_manager.notch_display_height}};
-    }
-    
-    return (CGRect) {{origin.x, origin.y},
-                      {bounds.size.width,
-                      h}};
+    return (CGRect) {origin, size};
   }
 }
 
@@ -532,8 +760,54 @@ bool bar_set_expand_progress(void* target, int progress) {
   struct bar* bar = target;
   if (bar->expand_progress == progress) return false;
   bar->expand_progress = progress;
+  // Only actually resizes the window once the collapse animation has
+  // finished; every other frame just redraws the shape.
   bar_resize(bar);
+  g_bar_manager.bar_needs_update = true;
+  if (progress == 0 && !bar->expanded) bar_release_island_if_idle();
   return true;
+}
+
+static bool bar_any_expanded() {
+  for (int i = 0; i < g_bar_manager.bar_count; i++) {
+    if (g_bar_manager.bars[i] && g_bar_manager.bars[i]->expanded) return true;
+  }
+  return false;
+}
+
+void bar_toggle_expanded(struct bar* bar) {
+  bar->expanded = !bar->expanded;
+  bar_cancel_island_scroll(bar);
+  bar_cancel_island_transition(bar);
+  if (bar->expanded) island_open(&bar->island);
+
+  // Clicks outside of our windows are only observed while an island is open.
+  mouse_watch_outside_clicks(bar_any_expanded());
+
+  // Grow the window to its expanded size before the first animation frame so
+  // that the animation never has to resize it.
+  bar_resize(bar);
+  g_bar_manager.bar_needs_update = true;
+
+  bool needs_refresh = false;
+  uint32_t duration = g_bar_manager.animator.duration;
+  char interp_function = g_bar_manager.animator.interp_function;
+  g_bar_manager.animator.duration = BAR_EXPAND_DURATION;
+  g_bar_manager.animator.interp_function = INTERP_FUNCTION_SIN;
+
+  ANIMATE(bar_set_expand_progress,
+          bar,
+          bar->expand_progress,
+          bar->expanded ? BAR_EXPAND_PROGRESS_MAX : 0);
+
+  // Lock it so that a click during the animation cancels it and reverses
+  // from the current progress instead of being queued behind it.
+  animator_lock(&g_bar_manager.animator);
+  g_bar_manager.animator.duration = duration;
+  g_bar_manager.animator.interp_function = interp_function;
+
+  (void)needs_refresh;
+  bar_manager_refresh(&g_bar_manager, false);
 }
 
 void bar_set_hidden(struct bar* bar, bool hidden) {
@@ -578,6 +852,12 @@ struct bar *bar_create(uint32_t did) {
 }
 
 void bar_destroy(struct bar *bar) {
+  // Don't leave a running expand animation pointing at freed memory.
+  animator_cancel_locked(&g_bar_manager.animator,
+                         bar,
+                         (animator_function*)bar_set_expand_progress);
+  bar_cancel_island_scroll(bar);
+  bar_cancel_island_transition(bar);
   window_close(&bar->window);
   free(bar);
 }

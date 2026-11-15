@@ -765,6 +765,7 @@ void handle_message_mach(struct mach_buffer* buffer) {
   animator_lock(&g_bar_manager.animator);
   bar_manager_unfreeze(&g_bar_manager);
   bar_manager_refresh(&g_bar_manager, false);
+  bar_manager_update_clock(&g_bar_manager);
 
   if (rsp) fclose(rsp);
 

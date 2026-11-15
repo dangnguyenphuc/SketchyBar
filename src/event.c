@@ -2,7 +2,6 @@
 #include "bar_manager.h"
 #include "custom_events.h"
 #include "hotload.h"
-#include "animation.h"
 
 extern struct bar_manager g_bar_manager;
 extern int g_connection;
@@ -89,26 +88,20 @@ static void event_mouse_up(void* context) {
   struct bar* bar = bar_manager_get_bar_by_wid(&g_bar_manager, wid);
   struct popup* popup = bar_manager_get_popup_by_wid(&g_bar_manager, wid);
   
-  struct bar* click_bar = bar ? bar : bar_manager_get_bar_by_point(&g_bar_manager, point);
-  if (click_bar) {
-    click_bar->expanded = !click_bar->expanded;
-    bool needs_refresh = false;
-    
-    uint32_t current_duration = g_bar_manager.animator.duration;
-    char current_interp = g_bar_manager.animator.interp_function;
-    
-    g_bar_manager.animator.duration = 40;
-    g_bar_manager.animator.interp_function = INTERP_FUNCTION_SIN;
-    
-    int t = click_bar->expanded ? 1000 : 0;
-    ANIMATE(bar_set_expand_progress, click_bar, click_bar->expand_progress, t);
-    
-    g_bar_manager.animator.duration = current_duration;
-    g_bar_manager.animator.interp_function = current_interp;
-
-    if (needs_refresh) {
-      g_bar_manager.bar_needs_update = true;
-      bar_manager_refresh(&g_bar_manager, false, false);
+  // Clicking the bar background toggles the notch expansion. Clicks on items
+  // or popups are handled by those and must not toggle it.
+  // Clicks on the island's own content (services, cards) are handled by the
+  // island and keep it open.
+  if (!bar_item && !popup) {
+    struct bar* click_bar = bar
+                            ? bar
+                            : bar_manager_get_bar_by_point(&g_bar_manager,
+                                                           point          );
+    if (click_bar) {
+      if (bar_island_click(click_bar, point))
+        bar_manager_refresh(&g_bar_manager, false);
+      else
+        bar_toggle_expanded(click_bar);
     }
   }
 
@@ -128,6 +121,20 @@ static void event_mouse_up(void* context) {
 
   if (bar_item && bar_item->needs_update)
     bar_manager_refresh(&g_bar_manager, false);
+}
+
+// Any mouse-down on screen while an island is open (see
+// mouse_watch_outside_clicks). Clicks inside the bar are handled on mouse-up
+// by event_mouse_up; a click anywhere else closes the island.
+static void event_mouse_down_global(void* context) {
+  CGPoint point = CGEventGetLocation(context);
+  if (bar_manager_get_popup_by_point(&g_bar_manager, point)) return;
+
+  for (int i = 0; i < g_bar_manager.bar_count; i++) {
+    struct bar* bar = g_bar_manager.bars[i];
+    if (bar->expanded && !bar_contains_point(bar, point))
+      bar_toggle_expanded(bar);
+  }
 }
 
 static void event_mouse_dragged(void* context) {
@@ -269,6 +276,34 @@ static void event_mouse_scrolled(void* context) {
         kCGScrollWheelEventDeltaAxis1);
   uint32_t modifier_keys = CGEventGetFlags(context);
 
+  // The open island scrolls its list itself, so it is handled before the
+  // throttling below. Trackpads deliver pixel deltas (incl. momentum) that
+  // are followed 1:1; mouse wheels deliver accelerated line deltas.
+  struct bar* island_bar = bar_manager_get_bar_by_wid(&g_bar_manager, wid);
+  if (island_bar) {
+    // Carbon delivers some scrolls both as kEventMouseScroll and as
+    // kEventMouseWheelMoved; apply each underlying event only once.
+    static CGEventTimestamp last_island_scroll = 0;
+    CGEventTimestamp timestamp = CGEventGetTimestamp(context);
+    if (timestamp && timestamp == last_island_scroll) return;
+
+    bool continuous
+      = CGEventGetIntegerValueField(context,
+                                    kCGScrollWheelEventIsContinuous);
+    CGFloat delta = continuous
+      ? CGEventGetIntegerValueField(context,
+                                    kCGScrollWheelEventPointDeltaAxis1)
+      : CGEventGetDoubleValueField(context,
+                                   kCGScrollWheelEventFixedPtDeltaAxis1)
+        * BAR_SCROLL_LINE_HEIGHT;
+
+    if (bar_island_scroll(island_bar, point, delta, continuous)) {
+      last_island_scroll = timestamp;
+      bar_manager_refresh(&g_bar_manager, false);
+      return;
+    }
+  }
+
   uint64_t event_time = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW_APPROX);
   if (g_scroll_info.timestamp + SCROLL_TIMEOUT > event_time) {
     g_scroll_info.delta_y += scroll_delta;
@@ -382,6 +417,7 @@ static callback_type* event_handler[] = {
   [MOUSE_ENTERED]              = event_mouse_entered,
   [MOUSE_EXITED]               = event_mouse_exited,
   [MOUSE_SCROLLED]             = event_mouse_scrolled,
+  [MOUSE_DOWN_GLOBAL]          = event_mouse_down_global,
   [VOLUME_CHANGED]             = event_volume_changed,
   [WIFI_CHANGED]               = event_wifi_changed,
   [BRIGHTNESS_CHANGED]         = event_brightness_changed,

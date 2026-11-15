@@ -73,9 +73,39 @@ void bar_manager_init(struct bar_manager* bar_manager) {
                                             clock_handler,
                                             NULL                      );
 
+  // Let macOS coalesce this wakeup with others instead of firing exactly.
+  CFRunLoopTimerSetTolerance(bar_manager->clock, 0.1);
+
   CFRunLoopAddTimer(CFRunLoopGetMain(),
                     bar_manager->clock,
                     kCFRunLoopCommonModes);
+
+  bar_manager->clock_running = true;
+  bar_manager_update_clock(bar_manager);
+}
+
+// The clock only drives periodic work: update_freq scripts, aliases and
+// scrolling texts. Without any of those it is parked so that an idle bar
+// doesn't wake up every second. Called whenever items change.
+void bar_manager_update_clock(struct bar_manager* bar_manager) {
+  bool needed = false;
+  for (int i = 0; i < bar_manager->bar_item_count; i++) {
+    struct bar_item* bar_item = bar_manager->bar_items[i];
+    if ((bar_item->updates && bar_item->update_frequency > 0)
+        || bar_item->has_alias
+        || bar_item->scroll_texts                            ) {
+      needed = true;
+      break;
+    }
+  }
+
+  if (needed == bar_manager->clock_running) return;
+  bar_manager->clock_running = needed;
+
+  CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+  CFRunLoopTimerSetNextFireDate(bar_manager->clock,
+                                needed ? now + 1.0
+                                       : now + 10.0*365*24*60*60);
 }
 
 void bar_manager_sort(struct bar_manager* bar_manager, struct bar_item** ordering, uint32_t count) {

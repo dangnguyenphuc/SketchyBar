@@ -4,6 +4,7 @@
 # https://github.com/FelixKratz/dotfiles
 
 PLUGIN_DIR="$CONFIG_DIR/plugins"
+BIN_FILE="/Users/lap14962/workspace/my-project/SketchyBar/bin/sketchybar"
 
 ##### Bar Appearance #####
 # Configuring the general appearance of the bar.
@@ -12,7 +13,7 @@ PLUGIN_DIR="$CONFIG_DIR/plugins"
 # If you are looking for other colors, see the color picker:
 # https://felixkratz.github.io/SketchyBar/config/tricks#color-picker
 
-sketchybar --bar position=top height=38 color=0xff000000 corner_radius=12 topmost=window
+$BIN_FILE --bar position=top height=38 color=0xff000000 corner_radius=20 topmost=window
 
 ##### Changing Defaults #####
 # We now change some default values, which are applied to all further items.
@@ -43,4 +44,4 @@ sketchybar --bar position=top height=38 color=0xff000000 corner_radius=12 topmos
 
 
 ##### Force all scripts to run the first time (never do this in a script) #####
-sketchybar --update
+$BIN_FILE --update

@@ -19,11 +19,11 @@ _OBJ = alias.o background.o bar_item.o custom_events.o event.o graph.o \
 			 image.o mouse.o shadow.o font.o text.o message.o mouse.o bar.o color.o \
 			 window.o bar_manager.o display.o display_nsscreen.om group.o mach.o popup.o \
 			 animation.o workspace.om volume.o slider.o power.o wifi.om media.om \
-			 hotload.o app_windows.o layer.om surface.o context.o
+			 hotload.o app_windows.o layer.om surface.o context.o island.o
 
 OBJ  = $(patsubst %, $(ODIR)/%, $(_OBJ))
 
-.PHONY: all clean arm x86 profile leak universal
+.PHONY: all clean arm profile leak universal test # x86
 
 all: clean universal
 
@@ -34,19 +34,20 @@ leak:
 	codesign -s - --entitlements bin/tmp.entitlements -f ./bin/sketchybar
 	leaks -atExit -- ./bin/sketchybar
 
-x86: CFLAGS+=-target x86_64-apple-macos10.13
-x86: $(ODIR)/sketchybar
+# x86: CFLAGS+=-target x86_64-apple-macos10.13
+# x86: $(ODIR)/sketchybar
 
 arm64: CFLAGS+=-target arm64-apple-macos11
 arm64: $(ODIR)/sketchybar
 
 universal:
-	$(MAKE) x86
-	mv $(ODIR)/sketchybar $(ODIR)/sketchybar_x86
+# 	$(MAKE) x86
+# 	mv $(ODIR)/sketchybar $(ODIR)/sketchybar_x86
 	rm -rf $(ODIR)/*.o*
 	$(MAKE) arm64
 	mv $(ODIR)/sketchybar $(ODIR)/sketchybar_arm64
-	lipo -create -output $(ODIR)/sketchybar $(ODIR)/sketchybar_x86 $(ODIR)/sketchybar_arm64
+	lipo -create -output $(ODIR)/sketchybar $(ODIR)/sketchybar_arm64 
+# $(ODIR)/sketchybar_x86 
 
 debug: CFLAGS=-std=c99 -Wall -g
 debug: arm64
@@ -54,6 +55,9 @@ debug: arm64
 asan: CFLAGS=-std=c99 -Wall -g -fsanitize=address -fsanitize=undefined -fno-omit-frame-pointer
 asan: clean arm64
 	./bin/sketchybar
+
+test: arm64
+	./tests/smoke.sh $(ODIR)/sketchybar
 
 $(ODIR)/sketchybar: $(SRC)/sketchybar.c $(OBJ) | $(ODIR)
 	$(CC) $(CFLAGS) $^ -o $@ $(LIBS)

@@ -14,6 +14,7 @@ typedef CLOCK_CALLBACK(clock_callback);
 
 struct bar_manager {
   CFRunLoopTimerRef clock;
+  bool clock_running;
 
   bool frozen;
   bool sleeps;
@@ -65,6 +66,7 @@ void bar_manager_handle_notification(struct bar_manager* bar_manager, struct not
 
 void bar_manager_animator_refresh(struct bar_manager* bar_manager, uint64_t time);
 void bar_manager_update(struct bar_manager* bar_manager, bool forced);
+void bar_manager_update_clock(struct bar_manager* bar_manager);
 void bar_manager_update_space_components(struct bar_manager* bar_manager, bool forced);
 bool bar_manager_set_margin(struct bar_manager* bar_manager, int margin);
 bool bar_manager_set_y_offset(struct bar_manager* bar_manager, int y_offset);
