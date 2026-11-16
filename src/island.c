@@ -1,10 +1,13 @@
 #include "island.h"
+#include "font.h"
 
 // Layout (points)
 #define ISLAND_PADDING        10
 #define ISLAND_PADDING_TOP    4
-#define ISLAND_SERVICE_WIDTH  64
+#define ISLAND_SERVICE_WIDTH  24
 #define ISLAND_SERVICE_HEIGHT 24
+#define ISLAND_ICON_SIZE      13
+#define ISLAND_NOTICE_HEIGHT  16
 #define ISLAND_SERVICE_GAP    3
 #define ISLAND_DIVIDER_GAP    7
 #define ISLAND_SCROLL_WIDTH   3
@@ -42,24 +45,30 @@ static const struct island_notification g_mock_notifications[] = {
   { "GitHub", "Review requested", "notch-island: add services panel", "3h" },
 };
 
-static const char* g_service_names[ISLAND_SERVICE_COUNT] = {
-  [ISLAND_SERVICE_ALERTS]   = "Alerts",
-  [ISLAND_SERVICE_MUSIC]    = "Music",
-  [ISLAND_SERVICE_CALENDAR] = "Calendar",
+// The services column shows Nerd Font icons (Font Awesome: bell, music,
+// calendar). Without FuraCode Nerd Font installed those glyphs don't exist,
+// so the column falls back to the service's initial.
+static const struct {
+  const char* icon;
+  const char* fallback;
+} g_services[ISLAND_SERVICE_COUNT] = {
+  [ISLAND_SERVICE_ALERTS]   = { "\xEF\x83\xB3", "A" },  // U+F0F3
+  [ISLAND_SERVICE_MUSIC]    = { "\xEF\x80\x81", "M" },  // U+F001
+  [ISLAND_SERVICE_CALENDAR] = { "\xEF\x81\xB3", "C" },  // U+F073
 };
 
 static const struct island_notification* g_notifications = NULL;
 static uint32_t g_notification_count = 0;
 
 static struct {
-  CTFontRef caption;   // app name, time, badge
+  CTFontRef caption;   // app name, time, install hint
   CTFontRef body;      // notification body
   CTFontRef title;     // notification title
-  CTFontRef service;   // service row
-  CTFontRef service_selected;
+  CTFontRef icon;      // services column
 } g_fonts;
 
 static bool g_loaded = false;
+static bool g_has_icons = false;
 
 static void island_load_notifications() {
   g_notifications = g_mock_notifications;
@@ -72,7 +81,34 @@ static void island_unload_notifications() {
   g_notification_count = 0;
 }
 
-void island_open(struct island* island) {
+static CTFontRef island_create_font(const char* family,
+                                    const char* style,
+                                    CGFloat size       ) {
+  CFStringRef family_ref = CFStringCreateWithCString(NULL,
+                                                     family,
+                                                     kCFStringEncodingUTF8);
+  CFStringRef style_ref = CFStringCreateWithCString(NULL,
+                                                    style,
+                                                    kCFStringEncodingUTF8);
+  const void* keys[] = { kCTFontFamilyNameAttribute,
+                         kCTFontStyleNameAttribute   };
+  const void* values[] = { family_ref, style_ref };
+  CFDictionaryRef attributes = CFDictionaryCreate(NULL, keys, values, 2,
+                                         &kCFTypeDictionaryKeyCallBacks,
+                                         &kCFTypeDictionaryValueCallBacks);
+
+  CTFontDescriptorRef descriptor
+    = CTFontDescriptorCreateWithAttributes(attributes);
+  CTFontRef font = CTFontCreateWithFontDescriptor(descriptor, size, NULL);
+
+  CFRelease(descriptor);
+  CFRelease(attributes);
+  CFRelease(style_ref);
+  CFRelease(family_ref);
+  return font;
+}
+
+void island_open(struct island* island, const char* family) {
   island->scroll_offset = 0;
   island->scroll_target = 0;
   island->previous_service = island->service;
@@ -80,14 +116,17 @@ void island_open(struct island* island) {
   island->transition = 1.0;
   if (g_loaded) return;
 
-  g_fonts.caption = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, 9, NULL);
-  g_fonts.body = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, 10, NULL);
-  g_fonts.title = CTFontCreateUIFontForLanguage(kCTFontUIFontEmphasizedSystem,
-                                                11,
-                                                NULL                         );
-  g_fonts.service = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, 11, NULL);
-  g_fonts.service_selected
-    = CTFontCreateUIFontForLanguage(kCTFontUIFontEmphasizedSystem, 11, NULL);
+  if (!family) family = font_default_family();
+  g_has_icons = font_default_family_installed();
+
+  g_fonts.caption = island_create_font(family, "Regular", 9);
+  g_fonts.body = island_create_font(family, "Regular", 10);
+  g_fonts.title = island_create_font(family, "Bold", 11);
+  g_fonts.icon = g_has_icons
+                 ? island_create_font(FONT_DEFAULT_FAMILY,
+                                      "Regular",
+                                      ISLAND_ICON_SIZE    )
+                 : island_create_font(family, "Bold", 11);
 
   island_load_notifications();
   g_loaded = true;
@@ -97,7 +136,7 @@ void island_release(void) {
   if (!g_loaded) return;
 
   CTFontRef* fonts[] = { &g_fonts.caption, &g_fonts.body, &g_fonts.title,
-                         &g_fonts.service, &g_fonts.service_selected  };
+                         &g_fonts.icon                                   };
 
   for (int i = 0; i < sizeof(fonts) / sizeof(fonts[0]); i++) {
     if (*fonts[i]) CFRelease(*fonts[i]);
@@ -121,10 +160,13 @@ struct island_layout {
 static struct island_layout island_get_layout(CGRect panel) {
   struct island_layout layout;
 
+  // Without the icon font the bottom edge holds the install hint instead of
+  // padding.
+  CGFloat bottom = g_has_icons ? ISLAND_PADDING : ISLAND_NOTICE_HEIGHT;
   layout.content = (CGRect){{ panel.origin.x + ISLAND_PADDING,
-                              panel.origin.y + ISLAND_PADDING },
+                              panel.origin.y + bottom          },
                             { panel.size.width - 2*ISLAND_PADDING,
-                              panel.size.height - ISLAND_PADDING
+                              panel.size.height - bottom
                                                 - ISLAND_PADDING_TOP }};
 
   CGFloat top = CGRectGetMaxY(layout.content);
@@ -316,33 +358,33 @@ static void island_draw_services(struct island* island,
   for (int i = 0; i < ISLAND_SERVICE_COUNT; i++) {
     CGRect row = layout->services[i];
 
-    // How "selected" the row is right now, so the labels cross-fade too.
+    // How "selected" the row is right now, so the icons cross-fade too.
     double weight = 0;
     if (i == island->service) weight += t;
     if (i == island->previous_service) weight += 1.0 - t;
-    bool selected = weight >= 0.5;
 
-    CGFloat text_x = row.origin.x + 8;
-    CGFloat baseline = row.origin.y + 8;
-    CGFloat available = row.size.width - 16;
-
-    if (i == ISLAND_SERVICE_ALERTS && g_notification_count > 0) {
-      char badge[16];
-      snprintf(badge, sizeof(badge), "%u", g_notification_count);
-      available -= island_draw_text(context, badge, g_fonts.caption, 0.55,
-                                    CGRectGetMaxX(row) - 7, baseline + 1,
-                                    available, ALIGN_RIGHT               )
-                   + 4;
-    }
+    // Center the glyph vertically on its line box.
+    CGFloat baseline = CGRectGetMidY(row)
+                       - (CTFontGetAscent(g_fonts.icon)
+                          - CTFontGetDescent(g_fonts.icon)) / 2.0;
 
     island_draw_text(context,
-                     g_service_names[i],
-                     selected ? g_fonts.service_selected : g_fonts.service,
-                     0.55 + 0.45 * weight,
-                     text_x,
+                     g_has_icons ? g_services[i].icon : g_services[i].fallback,
+                     g_fonts.icon,
+                     0.5 + 0.5 * weight,
+                     CGRectGetMidX(row),
                      baseline,
-                     available,
-                     ALIGN_LEFT                                            );
+                     row.size.width,
+                     ALIGN_CENTER                                            );
+
+    // Unread dot instead of a count, the column is only an icon wide.
+    if (i == ISLAND_SERVICE_ALERTS && g_notification_count > 0) {
+      CGContextSetRGBFillColor(context, 1.0, 0.36, 0.33, 0.95);
+      CGContextFillEllipseInRect(context,
+                                 CGRectMake(CGRectGetMaxX(row) - 7,
+                                            CGRectGetMaxY(row) - 7,
+                                            4, 4                   ));
+    }
   }
 
   CGContextSetRGBFillColor(context, 1, 1, 1, 0.14);
@@ -512,6 +554,17 @@ void island_draw(struct island* island,
 
   island_draw_services(island, context, &layout);
   island_draw_pages(island, context, &layout, alpha);
+
+  if (!g_has_icons) {
+    island_draw_text(context,
+                     "Install " FONT_DEFAULT_FAMILY " for the best look",
+                     g_fonts.caption,
+                     0.4,
+                     CGRectGetMidX(panel),
+                     panel.origin.y + 5,
+                     panel.size.width - 2*ISLAND_PADDING,
+                     ALIGN_CENTER                                        );
+  }
 
   CGContextRestoreGState(context);
 }

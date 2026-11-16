@@ -33,7 +33,9 @@ struct island {
   double transition;
 };
 
-void island_open(struct island* island);
+// `family` is the text font family (the bar's default font); NULL uses the
+// built-in default.
+void island_open(struct island* island, const char* family);
 void island_release(void);
 
 // All rects and points are in window-local coordinates (y-up). `panel` is the

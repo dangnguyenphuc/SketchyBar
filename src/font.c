@@ -149,10 +149,37 @@ void font_create_ctfont(struct font* font) {
   CFRelease(family_ref);
 }
 
+// Checked once (on the first font_init at startup) and cached.
+bool font_default_family_installed(void) {
+  static int installed = -1;
+  if (installed < 0) {
+    CFArrayRef families = CTFontManagerCopyAvailableFontFamilyNames();
+    installed = families
+                && CFArrayContainsValue(families,
+                                        CFRangeMake(0,
+                                                    CFArrayGetCount(families)),
+                                        CFSTR(FONT_DEFAULT_FAMILY)          );
+    if (families) CFRelease(families);
+
+    if (!installed) {
+      printf("[!] Font: '%s' is not installed, using '%s' instead. "
+             "Install it from fonts/Fura.zip for the best experience.\n",
+             FONT_DEFAULT_FAMILY,
+             FONT_FALLBACK_FAMILY);
+    }
+  }
+  return installed;
+}
+
+const char* font_default_family(void) {
+  return font_default_family_installed() ? FONT_DEFAULT_FAMILY
+                                         : FONT_FALLBACK_FAMILY;
+}
+
 void font_init(struct font* font) {
   font->size = 14.f;
   font->style = string_copy("Bold");
-  font->family = string_copy("Hack Nerd Font");
+  font->family = string_copy((char*)font_default_family());
   font->typographical_width = false;
   font_create_ctfont(font);
 }

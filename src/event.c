@@ -171,6 +171,7 @@ static void event_mouse_entered(void* context) {
       bar->mouse_over = true;
       bar_manager_handle_mouse_entered_global(&g_bar_manager);
     }
+    bar_island_touch(bar);
     return;
   }
 
@@ -212,6 +213,9 @@ static void event_mouse_exited(void* context) {
     bar_target = bar_manager_get_bar_by_point(&g_bar_manager, point);
     over_target = (bar_target != NULL);
   }
+
+  // The island's idle countdown restarts when the pointer leaves it.
+  if (bar) bar_island_touch(bar);
 
   if (bar || popup) {
     // Handle global mouse exited event

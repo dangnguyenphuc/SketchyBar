@@ -25,6 +25,10 @@
 // Slide between service pages (60Hz frames, ease-out).
 #define BAR_PAGE_DURATION         22
 
+// An open island closes after this many seconds without a click, scroll or
+// hover. It never closes while the pointer is over it.
+#define BAR_ISLAND_IDLE_TIMEOUT   60.0
+
 struct bar {
   bool shown;
   bool hidden;
@@ -39,6 +43,7 @@ struct bar {
   struct window window;
   struct island island;
   uint64_t scroll_glide_time;
+  CFAbsoluteTime island_activity;
 };
 
 struct bar *bar_create(uint32_t did);
@@ -59,5 +64,6 @@ bool bar_island_scroll(struct bar* bar,
                        CGFloat delta,
                        bool continuous);
 bool bar_contains_point(struct bar* bar, CGPoint point);
+void bar_island_touch(struct bar* bar);
 
 void bar_change_space(struct bar* bar, uint64_t dsid);

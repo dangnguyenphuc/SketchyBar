@@ -316,6 +316,7 @@ bool bar_contains_point(struct bar* bar, CGPoint point) {
 
 bool bar_island_click(struct bar* bar, CGPoint point) {
   if (!bar_shows_island(bar)) return false;
+  bar_island_touch(bar);
   // A service switch resets the scroll position; a still running scroll
   // animation must not move it again.
   bar_cancel_island_scroll(bar);
@@ -339,6 +340,7 @@ bool bar_island_scroll(struct bar* bar,
                        CGFloat delta,
                        bool continuous) {
   if (!bar_shows_island(bar)) return false;
+  bar_island_touch(bar);
   if (!island_handle_scroll(&bar->island,
                             bar_get_island_panel(bar),
                             bar_get_local_point(bar, point),
@@ -768,6 +770,58 @@ bool bar_set_expand_progress(void* target, int progress) {
   return true;
 }
 
+// ---------------------------------------------------------- idle auto-close
+// One timer for all bars, always set to the earliest idle deadline of any
+// open island (parked far in the future while none is open).
+static CFRunLoopTimerRef g_island_idle_timer = NULL;
+static void bar_island_idle_handler(CFRunLoopTimerRef timer, void* context);
+
+static void bar_island_schedule_idle() {
+  CFAbsoluteTime next = 0;
+  for (int i = 0; i < g_bar_manager.bar_count; i++) {
+    struct bar* bar = g_bar_manager.bars[i];
+    if (!bar || !bar->expanded) continue;
+    CFAbsoluteTime deadline = bar->island_activity + BAR_ISLAND_IDLE_TIMEOUT;
+    if (!next || deadline < next) next = deadline;
+  }
+
+  if (!g_island_idle_timer) {
+    if (!next) return;
+    g_island_idle_timer = CFRunLoopTimerCreate(NULL, next, 1e9, 0, 0,
+                                               bar_island_idle_handler,
+                                               NULL                    );
+    CFRunLoopAddTimer(CFRunLoopGetMain(),
+                      g_island_idle_timer,
+                      kCFRunLoopCommonModes);
+    return;
+  }
+
+  CFRunLoopTimerSetNextFireDate(g_island_idle_timer,
+                                next ? next
+                                     : CFAbsoluteTimeGetCurrent() + 1e9);
+}
+
+static void bar_island_idle_handler(CFRunLoopTimerRef timer, void* context) {
+  CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+  for (int i = 0; i < g_bar_manager.bar_count; i++) {
+    struct bar* bar = g_bar_manager.bars[i];
+    if (!bar || !bar->expanded) continue;
+
+    // Hovering counts as interaction for as long as it lasts.
+    if (bar->mouse_over) bar->island_activity = now;
+    else if (now - bar->island_activity >= BAR_ISLAND_IDLE_TIMEOUT - 0.05)
+      bar_toggle_expanded(bar);
+  }
+  bar_island_schedule_idle();
+  windows_unfreeze();
+}
+
+void bar_island_touch(struct bar* bar) {
+  if (!bar->expanded) return;
+  bar->island_activity = CFAbsoluteTimeGetCurrent();
+  bar_island_schedule_idle();
+}
+
 static bool bar_any_expanded() {
   for (int i = 0; i < g_bar_manager.bar_count; i++) {
     if (g_bar_manager.bars[i] && g_bar_manager.bars[i]->expanded) return true;
@@ -779,7 +833,12 @@ void bar_toggle_expanded(struct bar* bar) {
   bar->expanded = !bar->expanded;
   bar_cancel_island_scroll(bar);
   bar_cancel_island_transition(bar);
-  if (bar->expanded) island_open(&bar->island);
+  if (bar->expanded) {
+    island_open(&bar->island,
+                g_bar_manager.default_item.label.font.family);
+    bar->island_activity = CFAbsoluteTimeGetCurrent();
+  }
+  bar_island_schedule_idle();
 
   // Clicks outside of our windows are only observed while an island is open.
   mouse_watch_outside_clicks(bar_any_expanded());

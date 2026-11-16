@@ -37,14 +37,19 @@ jobs:
           lipo -archs bin/sketchybar | grep -qw arm64
           ./bin/sketchybar --version
 
+      # The release ships the default font (FuraCode Nerd Font) next to the
+      # binary: sketchybar runs without it, but asks the user to install it.
       - name: Package
         run: |
+          test -f fonts/Fura.zip || { echo "::error::fonts/Fura.zip is missing"; exit 1; }
           VERSION="$(./bin/sketchybar --version)"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          mkdir -p dist
-          cp bin/sketchybar dist/
-          tar -czf "dist/$VERSION-macos-arm64.tar.gz" -C bin sketchybar
-          shasum -a 256 dist/*.tar.gz | tee dist/SHA256SUMS
+          mkdir -p "dist/$VERSION/fonts"
+          cp bin/sketchybar "dist/$VERSION/"
+          cp fonts/Fura.zip "dist/$VERSION/fonts/"
+          tar -czf "dist/$VERSION-macos-arm64.tar.gz" -C dist "$VERSION"
+          rm -rf "dist/$VERSION"
+          (cd dist && shasum -a 256 *.tar.gz | tee SHA256SUMS)
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -53,3 +58,25 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 14
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

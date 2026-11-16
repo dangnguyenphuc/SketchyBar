@@ -13,6 +13,15 @@ struct font {
   char* features;
 };
 
+// Default font family of every item (overridable in the config). Shipped as
+// fonts/Fura.zip in the release; when it isn't installed the bar still runs
+// with the fallback family and the island shows an install hint.
+#define FONT_DEFAULT_FAMILY  "FuraCode Nerd Font"
+#define FONT_FALLBACK_FAMILY "Menlo"
+
+bool font_default_family_installed(void);
+const char* font_default_family(void);
+
 void font_register(char* font_path);
 
 void font_init(struct font* font);
