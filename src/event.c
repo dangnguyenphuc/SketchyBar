@@ -141,6 +141,13 @@ static void event_mouse_dragged(void* context) {
   CGPoint point = CGEventGetLocation(context);
   uint32_t wid = get_wid_from_cg_event(context);
 
+  // Dragging the island's volume slider.
+  struct bar* bar = bar_manager_get_bar_by_wid(&g_bar_manager, wid);
+  if (bar && bar_island_drag(bar, point)) {
+    bar_manager_refresh(&g_bar_manager, false);
+    return;
+  }
+
   struct window* window = NULL;
   struct bar_item* bar_item = bar_manager_get_item_by_wid(&g_bar_manager,
                                                           wid,

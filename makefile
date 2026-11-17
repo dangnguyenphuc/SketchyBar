@@ -5,6 +5,8 @@ LIBS     = -framework Carbon \
 					 -framework QuartzCore \
 					 -framework CoreAudio \
 					 -framework CoreWLAN \
+					 -framework Network \
+					 -framework IOBluetooth \
 					 -framework CoreVideo \
 					 -framework IOKit \
 					 -F/System/Library/PrivateFrameworks \
@@ -19,7 +21,7 @@ _OBJ = alias.o background.o bar_item.o custom_events.o event.o graph.o \
 			 image.o mouse.o shadow.o font.o text.o message.o mouse.o bar.o color.o \
 			 window.o bar_manager.o display.o display_nsscreen.om group.o mach.o popup.o \
 			 animation.o workspace.om volume.o slider.o power.o wifi.om media.om \
-			 hotload.o app_windows.o layer.om surface.o context.o island.o
+			 hotload.o app_windows.o layer.om surface.o context.o island.o stats.o now_playing.om audio_output.o system_info.om connections.om password_field.om desktops.o
 
 OBJ  = $(patsubst %, $(ODIR)/%, $(_OBJ))
 
@@ -59,8 +61,10 @@ asan: clean arm64
 test: arm64
 	./tests/smoke.sh $(ODIR)/sketchybar
 
-$(ODIR)/sketchybar: $(SRC)/sketchybar.c $(OBJ) | $(ODIR)
-	$(CC) $(CFLAGS) $^ -o $@ $(LIBS)
+# The Info.plist is embedded for the Bluetooth permission prompt.
+$(ODIR)/sketchybar: $(SRC)/sketchybar.c $(OBJ) $(SRC)/Info.plist | $(ODIR)
+	$(CC) $(CFLAGS) $(filter-out $(SRC)/Info.plist,$^) -o $@ $(LIBS) \
+		-Wl,-sectcreate,__TEXT,__info_plist,$(SRC)/Info.plist
 
 $(ODIR)/%.o: $(SRC)/%.c $(SRC)/%.h | $(ODIR)
 	$(CC) -c -o $@ $< $(CFLAGS)

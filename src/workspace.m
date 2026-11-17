@@ -61,6 +61,32 @@ int workspace_display_notch_height(uint32_t did)
   return height;
 }
 
+// Width of the camera housing on the built-in display, from the free menu bar
+// areas macOS reports on either side of it. 0 without a notch.
+int workspace_display_notch_width(uint32_t did)
+{
+  if (!CGDisplayIsBuiltin(did)) return 0;
+
+  int width = 0;
+  #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 120000
+  if (__builtin_available(macos 12.0, *)) {
+    @autoreleasepool {
+      for (NSScreen *screen in [NSScreen screens]) {
+        if ([[[screen deviceDescription] objectForKey:@"NSScreenNumber"] unsignedIntValue] != did)
+          continue;
+
+        NSRect left = screen.auxiliaryTopLeftArea;
+        NSRect right = screen.auxiliaryTopRightArea;
+        if (!NSIsEmptyRect(left) && !NSIsEmptyRect(right))
+          width = ceil(NSMinX(right) - NSMaxX(left));
+      }
+    }
+  }
+  #endif
+
+  return width;
+}
+
 void forced_front_app_event() {
   @autoreleasepool {
     NSString* name = [[[NSWorkspace sharedWorkspace] frontmostApplication] localizedName];

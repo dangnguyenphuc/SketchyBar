@@ -998,6 +998,7 @@ void bar_manager_handle_space_change(struct bar_manager* bar_manager, bool force
       if (!bar_manager->sticky && bar_manager->bars[i]->shown)
         bar_change_space(bar_manager->bars[i], dsid);
     }
+    bar_island_spaces_changed(bar_manager->bars[i]);
     if (i == bar_manager->bar_count - 1)
       separator[0] = '\0';
 

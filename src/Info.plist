@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Embedded into the sketchybar binary (__TEXT,__info_plist, see makefile).
+     macOS only shows the Bluetooth permission prompt, and only lets a
+     process use Bluetooth at all, if it carries this description. -->
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.sketchybar.island</string>
+  <key>CFBundleName</key>
+  <string>SketchyBar</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>SketchyBar lists your paired Bluetooth devices and connects them from the island's Connections tab.</string>
+</dict>
+</plist>

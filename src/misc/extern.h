@@ -7,6 +7,7 @@ extern CGError DisplayServicesUnregisterForBrightnessChangeNotifications(uint32_
 extern CGError DisplayServicesUnregisterForAmbientLightCompensationNotifications(uint32_t did, uint32_t passthrough);
 
 extern CGError DisplayServicesGetBrightness(uint32_t did, float* brightness);
+extern CGError DisplayServicesSetBrightness(uint32_t did, float brightness);
 extern CGError DisplayServicesCanChangeBrightness(uint32_t did);
 extern CGError DisplayServicesAmbientLightCompensationEnabled(uint32_t did, bool* out);
 

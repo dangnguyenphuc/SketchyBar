@@ -11,6 +11,15 @@
 #define BAR_NOTCH_COLLAPSED_WIDTH 218
 #define BAR_NOTCH_EXPANDED_WIDTH  291
 #define BAR_NOTCH_EXPANDED_HEIGHT 183
+// Expanded width while the Wi-Fi password prompt is open, and how long the
+// island takes to widen (60Hz frames).
+#define BAR_NOTCH_WIDE_WIDTH      371
+#define BAR_WIDE_DURATION         20
+// Connections tab switches: slide duration (60Hz frames), and how long a
+// clicked switch shows the new state before falling back to the real one
+// (when the change didn't happen).
+#define BAR_TOGGLE_DURATION       14
+#define BAR_TOGGLE_PENDING        5.0
 #define BAR_EXPAND_PROGRESS_MAX   1000
 #define BAR_EXPAND_DURATION       30
 
@@ -29,6 +38,13 @@
 // hover. It never closes while the pointer is over it.
 #define BAR_ISLAND_IDLE_TIMEOUT   60.0
 
+// CPU/RAM are sampled every BAR_STATS_INTERVAL seconds from startup on, open
+// or not, so the System tab's graphs always cover the last
+// SYSTEM_STATS_HISTORY samples. While all islands are closed that is all the
+// timer does (no battery, no redraw).
+#define BAR_STATS_INTERVAL        2.0
+#define BAR_STATS_TOLERANCE       0.5
+
 struct bar {
   bool shown;
   bool hidden;
@@ -39,9 +55,20 @@ struct bar {
   uint32_t dsid;
   uint32_t did;
   uint32_t adid;
+  // Camera housing width on this display (0: none, use notch_width).
+  uint32_t notch_width;
 
   struct window window;
   struct island island;
+  // Widened for the Wi-Fi prompt (target) and the animation's progress.
+  bool wide;
+  int wide_progress;
+  // Screens tab: this display's desktops, read while the tab is shown.
+  struct desktops desktops;
+  int desktops_problem;
+  // System tab: this display's brightness, read while the tab is shown.
+  bool has_brightness;
+  float brightness;
   uint64_t scroll_glide_time;
   CFAbsoluteTime island_activity;
 };
@@ -58,6 +85,8 @@ void bar_order_item_windows(struct bar* bar);
 bool bar_draws_item(struct bar* bar, struct bar_item* bar_item);
 bool bar_set_expand_progress(void* target, int progress);
 void bar_toggle_expanded(struct bar* bar);
+bool bar_island_drag(struct bar* bar, CGPoint point);
+void bar_island_spaces_changed(struct bar* bar);
 bool bar_island_click(struct bar* bar, CGPoint point);
 bool bar_island_scroll(struct bar* bar,
                        CGPoint point,
