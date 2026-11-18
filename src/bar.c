@@ -190,9 +190,30 @@ static bool bar_uses_expanded_window(struct bar* bar) {
 // Rect of the visible shape inside the window (CG coordinates, y-up). It is
 // centered horizontally and pinned to the screen edge the bar is attached to,
 // so its top (or bottom) edge never moves during the animation.
+static bool bar_uses_peek_window(struct bar* bar) {
+  return bar_is_horizontal()
+         && !bar_uses_expanded_window(bar)
+         && (bar->peeking || bar->peek_progress > 0);
+}
+
 static CGRect bar_get_shape_bounds(struct bar* bar) {
   CGRect frame = bar->window.frame;
   if (!bar_is_horizontal()) return frame;
+
+  // Peek: the collapsed shape grows into the wider window, `peek_left` to
+  // the left and `peek_right` to the right of where it normally sits.
+  if (bar_uses_peek_window(bar)) {
+    CGSize collapsed = bar_get_shape_size(bar, 0);
+    double t = bar_progress_fraction(bar->peek_progress);
+    frame.origin.x = round(bar->peek_left * (1.0 - t));
+    frame.origin.y = g_bar_manager.position == POSITION_BOTTOM
+                     ? 0
+                     : frame.size.height - collapsed.height;
+    frame.size = (CGSize){ round(collapsed.width
+                                 + (bar->peek_left + bar->peek_right) * t),
+                           collapsed.height                              };
+    return frame;
+  }
 
   CGSize size = bar_get_shape_size(bar, bar->expand_progress);
   if (size.width > frame.size.width) size.width = frame.size.width;
@@ -327,6 +348,14 @@ static void bar_island_perform(struct bar* bar, struct island_action* action) {
     case ISLAND_ACTION_SET_VOLUME:
       audio_output_set_volume(action->value);
       break;
+    case ISLAND_ACTION_NOTIFICATION_OPEN:
+      notifications_open(action->index);
+      island_clamp_scroll(&bar->island, bar_get_island_panel(bar));
+      break;
+    case ISLAND_ACTION_NOTIFICATIONS_READ_ALL:
+      notifications_read_all();
+      island_clamp_scroll(&bar->island, bar_get_island_panel(bar));
+      break;
     case ISLAND_ACTION_SET_BRIGHTNESS:
       if (bar->has_brightness) {
         DisplayServicesSetBrightness(bar->did, action->value);
@@ -398,6 +427,44 @@ static void bar_glide_island_scroll(struct bar* bar) {
   g_bar_manager.animator.interp_function = INTERP_FUNCTION_LINEAR;
 
   ANIMATE(bar_step_island_scroll, bar, 0, 1);
+  animator_lock(&g_bar_manager.animator);
+
+  g_bar_manager.animator.duration = saved_duration;
+  g_bar_manager.animator.interp_function = saved_interp;
+  (void)needs_refresh;
+}
+
+// One frame of the Alerts cards' animations (see island_step_cards). The
+// driver's value only reaches 1 on its last frame: then everything settles.
+static bool bar_step_island_cards(void* target, int value) {
+  struct bar* bar = target;
+  uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  double dt = (double)(now - bar->cards_time) / 1e9;
+  if (!bar->cards_time || dt <= 0 || dt > 0.05) dt = 1.0 / 60.0;
+  bar->cards_time = now;
+
+  island_step_cards(&bar->island, dt, value >= 1);
+  g_bar_manager.bar_needs_update = true;
+  return true;
+}
+
+static void bar_cancel_island_cards(struct bar* bar) {
+  animator_cancel_locked(&g_bar_manager.animator,
+                         bar,
+                         (animator_function*)bar_step_island_cards);
+}
+
+static void bar_animate_island_cards(struct bar* bar) {
+  bar_cancel_island_cards(bar);
+  bar->cards_time = 0;
+
+  bool needs_refresh = false;
+  uint32_t saved_duration = g_bar_manager.animator.duration;
+  char saved_interp = g_bar_manager.animator.interp_function;
+  g_bar_manager.animator.duration = BAR_CARDS_FRAMES;
+  g_bar_manager.animator.interp_function = INTERP_FUNCTION_LINEAR;
+
+  ANIMATE(bar_step_island_cards, bar, 0, 1);
   animator_lock(&g_bar_manager.animator);
 
   g_bar_manager.animator.duration = saved_duration;
@@ -559,9 +626,41 @@ bool bar_island_scroll(struct bar* bar,
 static void bar_release_island_if_idle() {
   for (int i = 0; i < g_bar_manager.bar_count; i++) {
     struct bar* bar = g_bar_manager.bars[i];
-    if (bar && (bar->expanded || bar->expand_progress > 0)) return;
+    if (bar && (bar->expanded || bar->expand_progress > 0
+                || bar->peeking || bar->peek_progress > 0)) {
+      return;
+    }
   }
   island_release();
+}
+
+// ------------------------------------------------------------ peek layout
+
+static double bar_notch_width(struct bar* bar) {
+  return bar->notch_width > 0 ? bar->notch_width : g_bar_manager.notch_width;
+}
+
+// Where the peek's icon (left of the camera) and text (right of it) go,
+// window-local (y-up), vertically centered in the collapsed band.
+static void bar_get_peek_rects(struct bar* bar, CGRect* icon, CGRect* text) {
+  CGSize collapsed = bar_get_shape_size(bar, 0);
+  CGFloat height = collapsed.height;
+  CGFloat bottom = g_bar_manager.position == POSITION_BOTTOM
+                   ? 0
+                   : bar->window.frame.size.height - height;
+  // The window starts `peek_left` left of the collapsed shape.
+  CGFloat center = bar->peek_left + collapsed.width / 2.0;
+  CGFloat notch = bar_notch_width(bar);
+
+  *icon = (CGRect){{ center - notch / 2.0 - BAR_PEEK_PADDING - BAR_PEEK_ICON,
+                     bottom + (height - BAR_PEEK_ICON) / 2.0                },
+                   { BAR_PEEK_ICON, BAR_PEEK_ICON }};
+  CGFloat text_x = center + notch / 2.0 + BAR_PEEK_PADDING;
+  *text = (CGRect){{ text_x, bottom },
+                   { bar->window.frame.size.width - text_x
+                     - BAR_PEEK_PADDING
+                     - g_bar_manager.background.corner_radius / 2.0,
+                     height                                         }};
 }
 
 // The shape drawn into the window: the visible shape stretched past the
@@ -593,6 +692,15 @@ void bar_draw(struct bar* bar, bool forced) {
     windows_freeze();
     CGContextClearRect(bar->window.surface->context, bar->window.frame);
     background_draw(&background, bar->window.surface->context);
+
+    if (bar_uses_peek_window(bar) && bar->peek_progress > 0) {
+      CGRect icon, text;
+      bar_get_peek_rects(bar, &icon, &text);
+      // The icon and text fade in over the last part of the growth.
+      double t = bar_progress_fraction(bar->peek_progress);
+      island_draw_peek(bar->window.surface->context, &bar->peek_item,
+                       bar->peek_text, icon, text, (t - 0.6) / 0.4    );
+    }
 
     if (bar_is_horizontal() && bar->expand_progress > 0) {
       struct island_data data = bar_island_data();
@@ -936,8 +1044,13 @@ static CGRect bar_get_frame(struct bar *bar) {
                                           : 0                       );
 
     // Centered on the display (keeps the display's own x origin, so this also
-    // works on secondary monitors).
+    // works on secondary monitors). A peek widens it unevenly: the collapsed
+    // shape stays centered, the window reaches further out on each side.
     origin.x = bounds.origin.x + round((bounds.size.width - size.width) / 2.0);
+    if (bar_uses_peek_window(bar)) {
+      origin.x -= bar->peek_left;
+      size.width += bar->peek_left + bar->peek_right;
+    }
     origin.y = bounds.origin.y + g_bar_manager.background.y_offset
                                + notch_offset;
 
@@ -1079,9 +1192,140 @@ static void bar_island_sources_changed(void) {
   windows_unfreeze();
 }
 
+// ------------------------------------------------------------ peek
+
+static bool bar_is_alive(struct bar* bar) {
+  for (int i = 0; i < g_bar_manager.bar_count; i++) {
+    if (g_bar_manager.bars[i] == bar) return true;
+  }
+  return false;
+}
+
+static bool bar_set_peek_progress(void* target, int value) {
+  struct bar* bar = target;
+  if (bar->peek_progress == value) return false;
+  bar->peek_progress = value;
+  g_bar_manager.bar_needs_update = true;
+
+  // Shrunk back: the window returns to the collapsed size.
+  if (value == 0 && !bar->peeking) {
+    bar->peek_left = bar->peek_right = 0;
+    bar_resize(bar);
+    bar_release_island_if_idle();
+  }
+  return true;
+}
+
+static void bar_cancel_peek(struct bar* bar) {
+  animator_cancel_locked(&g_bar_manager.animator,
+                         bar,
+                         (animator_function*)bar_set_peek_progress);
+}
+
+static void bar_animate_peek(struct bar* bar) {
+  bar_cancel_peek(bar);
+
+  bool needs_refresh = false;
+  uint32_t saved_duration = g_bar_manager.animator.duration;
+  char saved_interp = g_bar_manager.animator.interp_function;
+  g_bar_manager.animator.duration = BAR_PEEK_DURATION;
+  g_bar_manager.animator.interp_function = INTERP_FUNCTION_SIN;
+
+  ANIMATE(bar_set_peek_progress,
+          bar,
+          bar->peek_progress,
+          bar->peeking ? BAR_EXPAND_PROGRESS_MAX : 0);
+  animator_lock(&g_bar_manager.animator);
+
+  g_bar_manager.animator.duration = saved_duration;
+  g_bar_manager.animator.interp_function = saved_interp;
+  (void)needs_refresh;
+}
+
+// Ends a peek right away (the island is being opened).
+static void bar_stop_peek(struct bar* bar) {
+  if (!bar->peeking && bar->peek_progress == 0) return;
+  bar_cancel_peek(bar);
+  bar->peeking = false;
+  bar->peek_token++;
+  bar->peek_progress = 0;
+  bar->peek_left = bar->peek_right = 0;
+}
+
+// Shows `item` in the closed island: grow (BAR_PEEK_DURATION), hold
+// (BAR_PEEK_HOLD), shrink (BAR_PEEK_DURATION). A newer one during a peek
+// replaces it and starts the hold again.
+static void bar_peek(struct bar* bar, const struct notification_item* item) {
+  island_open(&bar->island, g_bar_manager.default_item.label.font.family);
+  bar->peek_item = *item;
+  CGFloat text = island_peek_text(item, bar->peek_text,
+                                  sizeof(bar->peek_text));
+
+  // How far past the collapsed shape each side has to reach: the icon left
+  // of the camera, the text right of it (clear of the rounded corner).
+  CGFloat collapsed = bar_get_shape_size(bar, 0).width;
+  CGFloat beside = (collapsed - bar_notch_width(bar)) / 2.0;
+  CGFloat corner = g_bar_manager.background.corner_radius / 2.0;
+  bar->peek_left = max(ceil(BAR_PEEK_PADDING * 2 + BAR_PEEK_ICON + corner
+                            - beside), 0);
+  bar->peek_right = max(ceil(BAR_PEEK_PADDING * 2 + text + corner - beside),
+                        0                                                  );
+
+  bar->peeking = true;
+  bar_resize(bar);
+  g_bar_manager.bar_needs_update = true;
+  if (bar->peek_progress < BAR_EXPAND_PROGRESS_MAX) bar_animate_peek(bar);
+
+  uint64_t token = ++bar->peek_token;
+  double hold = BAR_PEEK_DURATION / 60.0 + BAR_PEEK_HOLD;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, hold * NSEC_PER_SEC),
+                 dispatch_get_main_queue(),
+                 ^{
+    if (!bar_is_alive(bar) || token != bar->peek_token || !bar->peeking)
+      return;
+    bar->peeking = false;
+    bar_animate_peek(bar);
+    windows_unfreeze();
+  });
+}
+
+// Captured notifications changed. A new one (newer than the last peeked)
+// peeks in the closed island on the active display; open islands just
+// update their list.
+static CFAbsoluteTime g_peek_time = 0;
+
+static void bar_island_notifications_changed(void) {
+  const struct notification_list* list = notifications_get();
+  bool arrived = list->count > 0 && list->items[0].time > g_peek_time;
+  if (arrived) g_peek_time = list->items[0].time;
+
+  for (int i = 0; i < g_bar_manager.bar_count; i++) {
+    struct bar* bar = g_bar_manager.bars[i];
+    if (!bar) continue;
+    if (bar->expanded || bar->expand_progress > 0) {
+      // New cards slide in, closed ones out (animated only where the Alerts
+      // tab is showing).
+      bool visible = bar->expanded
+                     && bar->island.service == ISLAND_SERVICE_ALERTS;
+      if (island_sync_cards(&bar->island, visible))
+        bar_animate_island_cards(bar);
+      island_clamp_scroll(&bar->island, bar_get_island_panel(bar));
+    } else if (arrived && bar_is_horizontal() && bar->shown && !bar->hidden
+               && bar->adid == g_bar_manager.active_adid               ) {
+      bar_peek(bar, &list->items[0]);
+    }
+  }
+  g_bar_manager.bar_needs_update = true;
+  bar_manager_refresh(&g_bar_manager, false);
+  windows_unfreeze();
+}
+
 // Started with the first bar and never stopped, see BAR_STATS_INTERVAL.
+// Notification capture starts with it: banners only show for a few seconds,
+// so it has to run while the island is closed too.
 static void bar_start_stats_history() {
   if (g_stats_timer) return;
+  notifications_begin(bar_island_notifications_changed);
 
   // Takes the CPU baseline for the first tick.
   system_stats_sample_load(&g_island_stats);
@@ -1240,12 +1484,19 @@ static void bar_island_update_sources() {
 }
 
 void bar_toggle_expanded(struct bar* bar) {
+  // Clicking a peek opens the island on the notifications.
+  if (!bar->expanded && (bar->peeking || bar->peek_progress > 0)) {
+    bar_stop_peek(bar);
+    bar->island.service = ISLAND_SERVICE_ALERTS;
+  }
   bar->expanded = !bar->expanded;
   bar_cancel_island_scroll(bar);
   bar_cancel_island_transition(bar);
   if (bar->expanded) {
     island_open(&bar->island,
                 g_bar_manager.default_item.label.font.family);
+    bar_cancel_island_cards(bar);
+    island_sync_cards(&bar->island, false);
     bar->island_activity = CFAbsoluteTimeGetCurrent();
     if (bar->island.service == ISLAND_SERVICE_SCREENS)
       bar_island_update_desktops(bar);
@@ -1335,6 +1586,8 @@ void bar_destroy(struct bar *bar) {
   bar_cancel_island_scroll(bar);
   bar_cancel_island_transition(bar);
   bar_cancel_toggles(bar);
+  bar_cancel_peek(bar);
+  bar_cancel_island_cards(bar);
   window_close(&bar->window);
   free(bar);
 }

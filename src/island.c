@@ -19,6 +19,33 @@
 #define ISLAND_CARD_INSET     9
 #define ISLAND_PAGE_GAP       12
 
+// Alerts tab header ("N unread" and the Read all button) above the cards.
+#define ISLAND_ALERTS_HEADER  18
+#define ISLAND_ALERTS_GAP     4
+#define ISLAND_READ_ALL_WIDTH 58
+#define ISLAND_READ_ALL_HEIGHT 16
+
+// Alerts card animations: a new card starts ENTER points above its place
+// and fades in over APPEAR seconds; others glide to their place (TAU: time
+// constant); a closed card slides EXIT points right and fades over LEAVE
+// seconds, "Read all" staggers that by STAGGER seconds per card.
+#define ISLAND_CARD_ENTER      12
+#define ISLAND_CARD_APPEAR     0.28
+#define ISLAND_CARD_TAU        0.06
+#define ISLAND_CARD_EXIT       40
+#define ISLAND_CARD_LEAVE      0.24
+#define ISLAND_CARD_STAGGER    0.04
+
+// App icon on notification cards.
+#define ISLAND_APP_ICON_SIZE   30
+#define ISLAND_APP_ICON_RADIUS 8
+#define ISLAND_APP_ICON_GAP    8
+#define ISLAND_APP_GLYPH_SIZE  15
+#define ISLAND_APP_LETTER_SIZE 16
+
+// Peek text in the closed island.
+#define ISLAND_PEEK_FONT       12
+
 // Notch band: date (dd / mm / yy) on the left, battery/CPU/RAM on the right,
 // three rows each.
 #define ISLAND_DATE_ROWS      3
@@ -85,24 +112,6 @@
 // fades in, so it never looks squeezed while the shape is still small.
 #define ISLAND_FADE_START     0.55
 
-struct island_notification {
-  const char* app;
-  const char* title;
-  const char* body;
-  const char* time;
-};
-
-// Mock data for the first look. Replace island_load_notifications() with the
-// real Notification Center reader (plugins/notifications.py) later.
-static const struct island_notification g_mock_notifications[] = {
-  { "Messages", "Lan", "Are we still on for lunch tomorrow?", "now" },
-  { "Slack", "#sketchybar", "Minh: the island panel looks great 🎉", "2m" },
-  { "WhatsApp · iPhone", "Family", "Mom: Call me when you're free", "9m" },
-  { "Calendar", "Standup in 10 minutes", "Daily sync · Zoom", "14m" },
-  { "Mail", "Your invoice is ready", "Billing: Invoice #2048 for November", "1h" },
-  { "GitHub", "Review requested", "notch-island: add services panel", "3h" },
-};
-
 // The services column shows Nerd Font icons (Font Awesome: bell, music,
 // calendar). Without FuraCode Nerd Font installed those glyphs don't exist,
 // so the column falls back to the service's initial.
@@ -117,9 +126,6 @@ static const struct {
   [ISLAND_SERVICE_SCREENS]  = { "\xEF\x80\x89", "D" },  // U+F009 th-large
 };
 
-static const struct island_notification* g_notifications = NULL;
-static uint32_t g_notification_count = 0;
-
 static struct {
   CTFontRef caption;   // app name, time, install hint
   CTFontRef body;      // notification body
@@ -129,6 +135,9 @@ static struct {
   CTFontRef stats_icon;
   CTFontRef small_icon;  // music: speaker
   CTFontRef screen_icon; // screens: purpose icons
+  CTFontRef app_glyph;   // notification cards: app icon glyph
+  CTFontRef app_letter;  // ... or letter
+  CTFontRef peek;        // peek text in the closed island
 } g_fonts;
 
 // Music tab glyphs (Font Awesome in the Nerd Font), letters without it.
@@ -234,17 +243,6 @@ static void island_pick_stat_glyphs() {
 }
 static bool g_has_icons = false;
 
-static void island_load_notifications() {
-  g_notifications = g_mock_notifications;
-  g_notification_count = sizeof(g_mock_notifications)
-                         / sizeof(g_mock_notifications[0]);
-}
-
-static void island_unload_notifications() {
-  g_notifications = NULL;
-  g_notification_count = 0;
-}
-
 static CTFontRef island_create_font(const char* family,
                                     const char* style,
                                     CGFloat size       ) {
@@ -272,6 +270,8 @@ static CTFontRef island_create_font(const char* family,
   return font;
 }
 
+static void island_pick_app_icon_marks();
+
 void island_open(struct island* island, const char* family) {
   island->scroll_offset = 0;
   island->scroll_target = 0;
@@ -279,6 +279,7 @@ void island_open(struct island* island, const char* family) {
   island->previous_scroll_offset = 0;
   island->transition = 1.0;
   island->toggles_ready = false;
+  island->cards_synced = false;
   if (g_loaded) return;
 
   if (!family) family = font_default_family();
@@ -307,10 +308,18 @@ void island_open(struct island* island, const char* family) {
                         ? island_create_font(FONT_DEFAULT_FAMILY, "Regular",
                                              ISLAND_SCREEN_ICON             )
                         : island_create_font(family, "Bold", 13);
+  g_fonts.app_glyph = g_has_icons
+                      ? island_create_font(FONT_DEFAULT_FAMILY, "Regular",
+                                           ISLAND_APP_GLYPH_SIZE          )
+                      : island_create_font(family, "Bold",
+                                           ISLAND_APP_GLYPH_SIZE);
+  g_fonts.app_letter = island_create_font(family, "Bold",
+                                          ISLAND_APP_LETTER_SIZE);
+  g_fonts.peek = island_create_font(family, "Regular", ISLAND_PEEK_FONT);
   island_pick_stat_glyphs();
   island_pick_media_glyphs();
+  island_pick_app_icon_marks();
 
-  island_load_notifications();
   g_loaded = true;
 }
 
@@ -320,14 +329,14 @@ void island_release(void) {
   CTFontRef* fonts[] = { &g_fonts.caption, &g_fonts.body, &g_fonts.title,
                          &g_fonts.icon, &g_fonts.stats,
                          &g_fonts.stats_icon, &g_fonts.small_icon,
-                         &g_fonts.screen_icon                            };
+                         &g_fonts.screen_icon, &g_fonts.app_glyph,
+                         &g_fonts.app_letter, &g_fonts.peek              };
 
   for (int i = 0; i < sizeof(fonts) / sizeof(fonts[0]); i++) {
     if (*fonts[i]) CFRelease(*fonts[i]);
     *fonts[i] = NULL;
   }
 
-  island_unload_notifications();
   g_loaded = false;
 }
 
@@ -381,14 +390,36 @@ static struct island_layout island_get_layout(CGRect panel) {
   return layout;
 }
 
+// Alerts: a header ("N unread", "Read all") above the cards.
+static CGRect island_alerts_header(struct island_layout* layout) {
+  return (CGRect){{ layout->list.origin.x,
+                    CGRectGetMaxY(layout->list) - ISLAND_ALERTS_HEADER },
+                  { layout->list.size.width, ISLAND_ALERTS_HEADER }};
+}
+
+static CGRect island_alerts_read_all(struct island_layout* layout) {
+  CGRect header = island_alerts_header(layout);
+  return (CGRect){{ CGRectGetMaxX(header) - ISLAND_READ_ALL_WIDTH,
+                    CGRectGetMidY(header) - ISLAND_READ_ALL_HEIGHT / 2.0 },
+                  { ISLAND_READ_ALL_WIDTH, ISLAND_READ_ALL_HEIGHT }};
+}
+
+// The area the cards scroll in.
+static CGRect island_alerts_list(struct island_layout* layout) {
+  CGRect list = layout->list;
+  list.size.height -= ISLAND_ALERTS_HEADER + ISLAND_ALERTS_GAP;
+  return list;
+}
+
 static CGFloat island_list_height() {
-  if (g_notification_count == 0) return 0;
-  return g_notification_count * ISLAND_CARD_HEIGHT
-         + (g_notification_count - 1) * ISLAND_CARD_GAP;
+  int count = notifications_get()->count;
+  if (count == 0) return 0;
+  return count * ISLAND_CARD_HEIGHT + (count - 1) * ISLAND_CARD_GAP;
 }
 
 static CGFloat island_max_scroll(struct island_layout* layout) {
-  return max(island_list_height() - layout->list.size.height, 0);
+  return max(island_list_height() - island_alerts_list(layout).size.height,
+             0                                                           );
 }
 
 // The area a service page occupies: the list plus its scroll indicator.
@@ -396,17 +427,6 @@ static CGRect island_page_rect(struct island_layout* layout) {
   return (CGRect){{ layout->list.origin.x, layout->content.origin.y },
                   { CGRectGetMaxX(layout->content) - layout->list.origin.x,
                     layout->content.size.height                          }};
-}
-
-static CGRect island_card_rect(struct island_layout* layout,
-                               uint32_t index,
-                               CGFloat scroll_offset        ) {
-  CGFloat top = CGRectGetMaxY(layout->list)
-                - index * (ISLAND_CARD_HEIGHT + ISLAND_CARD_GAP)
-                + scroll_offset;
-
-  return (CGRect){{ layout->list.origin.x, top - ISLAND_CARD_HEIGHT },
-                  { layout->list.size.width, ISLAND_CARD_HEIGHT     }};
 }
 
 // ---------------------------------------------------------------- drawing
@@ -584,7 +604,7 @@ static void island_draw_services(struct island* island,
                      ALIGN_CENTER                                            );
 
     // Unread dot instead of a count, the column is only an icon wide.
-    if (i == ISLAND_SERVICE_ALERTS && g_notification_count > 0) {
+    if (i == ISLAND_SERVICE_ALERTS && notifications_get()->count > 0) {
       CGContextSetRGBFillColor(context, 1.0, 0.36, 0.33, 0.95);
       CGContextFillEllipseInRect(context,
                                  CGRectMake(CGRectGetMaxX(row) - 7,
@@ -597,17 +617,216 @@ static void island_draw_services(struct island* island,
   CGContextFillRect(context, layout->divider);
 }
 
+// "now", "5m", "2h", "3d" since the notification was captured.
+static void island_relative_time(CFAbsoluteTime time, char* out, size_t size) {
+  double seconds = CFAbsoluteTimeGetCurrent() - time;
+  if (seconds < 60) snprintf(out, size, "now");
+  else if (seconds < 3600) snprintf(out, size, "%dm", (int)(seconds / 60));
+  else if (seconds < 86400) snprintf(out, size, "%dh", (int)(seconds / 3600));
+  else snprintf(out, size, "%dd", (int)(seconds / 86400));
+}
+
+// ---------------------------------------------------------------- app icons
+
+static void island_draw_glyph(CGContextRef context,
+                              const char* glyph,
+                              CTFontRef font,
+                              uint32_t color,
+                              CGFloat alpha,
+                              CGRect rect       );
+
+// Common apps on notification cards: a rounded square in the brand color with
+// a Font Awesome glyph (Nerd Font), or a letter where the font has none.
+// Matched by the app name Notification Center shows, ignoring case.
+static const struct {
+  const char* name;
+  uint32_t color;
+  const char* glyph;   // NULL: letter only
+  const char* letter;
+} g_app_icons[] = {
+  { "Zalo",            0xff0068ff, NULL,              "Z" },
+  { "Messenger",       0xffa033ff, "\xEF\x89\xBA",    "m" },  // U+F27A
+  { "Messages",        0xff34c759, "\xEF\x81\xB5",    "M" },  // U+F075
+  { "WhatsApp",        0xff25d366, "\xEF\x88\xB2",    "W" },  // U+F232
+  { "Telegram",        0xff2aabee, "\xEF\x8B\x86",    "T" },  // U+F2C6
+  { "Slack",           0xff4a154b, "\xEF\x86\x98",    "S" },  // U+F198
+  { "Discord",         0xff5865f2, NULL,              "D" },
+  { "Microsoft Teams", 0xff5059c9, NULL,              "T" },
+  { "Teams",           0xff5059c9, NULL,              "T" },
+  { "Skype",           0xff00aff0, "\xEF\x85\xBE",    "S" },  // U+F17E
+  { "FaceTime",        0xff34c759, "\xEF\x80\xBD",    "F" },  // U+F03D
+  { "Zoom",            0xff2d8cff, "\xEF\x80\xBD",    "Z" },  // U+F03D
+  { "Mail",            0xff1e88e5, "\xEF\x83\xA0",    "M" },  // U+F0E0
+  { "Outlook",         0xff0078d4, "\xEF\x83\xA0",    "O" },  // U+F0E0
+  { "Gmail",           0xffea4335, "\xEF\x83\xA0",    "G" },  // U+F0E0
+  { "Calendar",        0xffff3b30, "\xEF\x81\xB3",    "C" },  // U+F073
+  { "Reminders",       0xffff9500, "\xEF\x80\xBA",    "R" },  // U+F03A
+  { "Notes",           0xffe5b100, "\xEF\x89\x89",    "N" },  // U+F249
+  { "Music",           0xfffa2d48, "\xEF\x80\x81",    "M" },  // U+F001
+  { "Spotify",         0xff1db954, "\xEF\x86\xBC",    "S" },  // U+F1BC
+  { "YouTube",         0xffff0000, "\xEF\x85\xAA",    "Y" },  // U+F16A
+  { "Facebook",        0xff1877f2, "\xEF\x82\x9A",    "f" },  // U+F09A
+  { "Instagram",       0xffe1306c, "\xEF\x85\xAD",    "I" },  // U+F16D
+  { "X",               0xff1a1a1a, NULL,              "X" },
+  { "Twitter",         0xff1da1f2, "\xEF\x82\x99",    "T" },  // U+F099
+  { "GitHub",          0xff24292f, "\xEF\x82\x9B",    "G" },  // U+F09B
+  { "Google Chrome",   0xff4285f4, "\xEF\x89\xA8",    "C" },  // U+F268
+  { "Safari",          0xff0a84ff, "\xEF\x89\xA7",    "S" },  // U+F267
+  { "Visual Studio Code", 0xff007acc, "\xEF\x84\xA1",  "C" },  // U+F121
+  { "Code",            0xff007acc, "\xEF\x84\xA1",    "C" },  // U+F121
+  { "Xcode",           0xff147efb, "\xEF\x84\xA1",    "X" },  // U+F121
+  { "Terminal",        0xff2b2b2b, "\xEF\x84\xA0",    ">" },  // U+F120
+  { "Jira",            0xff0052cc, NULL,              "J" },
+  { "Notion",          0xff1a1a1a, NULL,              "N" },
+  { "Figma",           0xffa259ff, NULL,              "F" },
+  { "Linear",          0xff5e6ad2, NULL,              "L" },
+  { "App Store",       0xff0d84ff, NULL,              "A" },
+  { "System Settings", 0xff8e8e93, "\xEF\x80\x93",    "S" },  // U+F013
+  { "Finder",          0xff1e90ff, NULL,              "F" },
+  { "Photos",          0xffff9f0a, "\xEF\x80\xBE",    "P" },  // U+F03E
+  { "Fitness",         0xfffa114f, "\xEF\x88\x9E",    "F" },  // U+F21E
+  { "Grab",            0xff00b14f, NULL,              "G" },
+  { "Shopee",          0xffee4d2d, NULL,              "S" },
+  { "MoMo",            0xffa50064, NULL,              "M" },
+  { "myVNG",           0xfff26722, NULL,              "V" },
+};
+#define APP_ICON_COUNT (sizeof(g_app_icons) / sizeof(g_app_icons[0]))
+
+// Per table entry: the glyph if the icon font has it, else the letter.
+static const char* g_app_icon_marks[APP_ICON_COUNT];
+
+static void island_pick_app_icon_marks() {
+  for (int i = 0; i < APP_ICON_COUNT; i++) {
+    const char* glyph = g_app_icons[i].glyph;
+    g_app_icon_marks[i] = g_has_icons && glyph
+                          && island_font_has_glyphs(g_fonts.app_glyph, glyph)
+                          ? glyph
+                          : g_app_icons[i].letter;
+  }
+}
+
+static int island_app_icon_index(const char* app) {
+  for (int i = 0; i < APP_ICON_COUNT; i++) {
+    if (strcasecmp(app, g_app_icons[i].name) == 0) return i;
+  }
+  return -1;
+}
+
+// Unknown apps get a blossom. The colors rotate: each new unknown app gets
+// the next one, and keeps it for the session.
+static const uint32_t g_blossom_colors[] = {
+  0xffff7eb6, 0xffb39df3, 0xff76cce0, 0xff9ed072, 0xfff39660, 0xffe7c664
+};
+#define BLOSSOM_COLOR_COUNT (sizeof(g_blossom_colors) / sizeof(g_blossom_colors[0]))
+#define BLOSSOM_APPS        32
+
+static struct {
+  char name[64];
+  int color;
+} g_blossom_apps[BLOSSOM_APPS];
+static int g_blossom_count = 0;
+static int g_blossom_next = 0;
+
+static uint32_t island_blossom_color(const char* app) {
+  for (int i = 0; i < g_blossom_count; i++) {
+    if (strcmp(g_blossom_apps[i].name, app) == 0)
+      return g_blossom_colors[g_blossom_apps[i].color];
+  }
+
+  // A new app: the next color (the table recycles its oldest slot).
+  int color = g_blossom_next % BLOSSOM_COLOR_COUNT;
+  int slot = g_blossom_next % BLOSSOM_APPS;
+  g_blossom_next++;
+  snprintf(g_blossom_apps[slot].name, sizeof(g_blossom_apps[slot].name),
+           "%s", app                                                    );
+  g_blossom_apps[slot].color = color;
+  if (g_blossom_count < BLOSSOM_APPS) g_blossom_count++;
+  return g_blossom_colors[color];
+}
+
+// Five petals around a light center, on a glass tile.
+static void island_draw_blossom(CGContextRef context,
+                                CGRect rect,
+                                uint32_t color     ) {
+  island_draw_glass(context, rect, ISLAND_APP_ICON_RADIUS, 1.0);
+
+  CGPoint center = { CGRectGetMidX(rect), CGRectGetMidY(rect) };
+  CGFloat size = rect.size.width;
+  CGFloat petal_width = size * 0.26;
+  CGFloat petal_length = size * 0.36;
+
+  CGContextSaveGState(context);
+  CGContextTranslateCTM(context, center.x, center.y);
+  island_set_fill(context, color, 0.95);
+  for (int i = 0; i < 5; i++) {
+    CGContextFillEllipseInRect(context,
+                               CGRectMake(-petal_width / 2.0,
+                                          size * 0.04,
+                                          petal_width,
+                                          petal_length          ));
+    CGContextRotateCTM(context, 2.0 * M_PI / 5.0);
+  }
+  CGFloat core = size * 0.2;
+  island_set_fill(context, 0xfffff4c2, 1.0);
+  CGContextFillEllipseInRect(context,
+                             CGRectMake(-core / 2.0, -core / 2.0, core, core));
+  CGContextRestoreGState(context);
+}
+
+static void island_draw_app_icon(CGContextRef context,
+                                 const char* app,
+                                 CGRect rect      ) {
+  int index = island_app_icon_index(app);
+  if (index < 0) {
+    island_draw_blossom(context, rect, island_blossom_color(app));
+    return;
+  }
+
+  island_add_rounded_rect(context, rect, ISLAND_APP_ICON_RADIUS);
+  island_set_fill(context, g_app_icons[index].color, 1.0);
+  CGContextFillPath(context);
+
+  // A soft top highlight, like the glass cards.
+  CGContextSaveGState(context);
+  island_add_rounded_rect(context, rect, ISLAND_APP_ICON_RADIUS);
+  CGContextClip(context);
+  island_set_fill(context, ISLAND_COLOR_WHITE, 0.12);
+  CGContextFillRect(context, CGRectMake(rect.origin.x, CGRectGetMidY(rect),
+                                        rect.size.width,
+                                        rect.size.height / 2.0          ));
+  CGContextRestoreGState(context);
+
+  const char* mark = g_app_icon_marks[index];
+  bool glyph = mark != g_app_icons[index].letter;
+  island_draw_glyph(context, mark, glyph ? g_fonts.app_glyph
+                                         : g_fonts.app_letter,
+                    ISLAND_COLOR_WHITE, 1.0, rect             );
+}
+
 static void island_draw_card(CGContextRef context,
-                             const struct island_notification* notification,
-                             CGRect card                                    ) {
+                             const struct notification_item* notification,
+                             CGRect card                                  ) {
+  // Opaque base (the island's black): the glass alone is see-through, which
+  // let a card fading out behind show through the one gliding over it.
+  island_add_rounded_rect(context, card, ISLAND_CARD_RADIUS);
+  island_set_fill(context, 0xff000000, 1.0);
+  CGContextFillPath(context);
   island_draw_glass(context, card, ISLAND_CARD_RADIUS, 1.0);
 
-  CGFloat x = card.origin.x + ISLAND_CARD_INSET;
+  // App icon on the left, the texts right of it.
+  CGRect icon = {{ card.origin.x + ISLAND_CARD_INSET,
+                   CGRectGetMidY(card) - ISLAND_APP_ICON_SIZE / 2.0 },
+                 { ISLAND_APP_ICON_SIZE, ISLAND_APP_ICON_SIZE }};
+  island_draw_app_icon(context, notification->app, icon);
+
+  CGFloat x = CGRectGetMaxX(icon) + ISLAND_APP_ICON_GAP;
   CGFloat right = CGRectGetMaxX(card) - ISLAND_CARD_INSET;
   CGFloat width = right - x;
   CGFloat top = CGRectGetMaxY(card);
 
-  CGFloat time_width = island_draw_text(context, notification->time,
+  char time[16];
+  island_relative_time(notification->time, time, sizeof(time));
+  CGFloat time_width = island_draw_text(context, time,
                                         g_fonts.caption, 0.5,
                                         right, top - 13, width, ALIGN_RIGHT);
 
@@ -625,12 +844,15 @@ static void island_draw_scroll_indicator(CGContextRef context,
   CGFloat max_scroll = island_max_scroll(layout);
   if (max_scroll <= 0) return;
 
+  CGRect list = island_alerts_list(layout);
   CGRect track = layout->scroll_track;
+  track.origin.y = list.origin.y;
+  track.size.height = list.size.height;
   island_add_rounded_rect(context, track, track.size.width / 2.0);
   CGContextSetRGBFillColor(context, 1, 1, 1, 0.10);
   CGContextFillPath(context);
 
-  CGFloat visible = layout->list.size.height / island_list_height();
+  CGFloat visible = list.size.height / island_list_height();
   CGFloat thumb_height = max(track.size.height * visible, ISLAND_SCROLL_MIN);
   CGFloat progress = scroll_offset / max_scroll;
 
@@ -654,20 +876,175 @@ static void island_draw_placeholder(CGContextRef context,
                    ALIGN_CENTER                    );
 }
 
+// ---------------------------------------------------------------- cards
+
+static CGFloat island_card_target(int index) {
+  return index * (ISLAND_CARD_HEIGHT + ISLAND_CARD_GAP);
+}
+
+static int island_notification_index(const char* id) {
+  const struct notification_list* list = notifications_get();
+  for (int i = 0; i < list->count; i++) {
+    if (strcmp(list->items[i].id, id) == 0) return i;
+  }
+  return -1;
+}
+
+static double island_ease_out(double t) {
+  t = max(min(t, 1.0), 0.0);
+  return 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);
+}
+
+bool island_sync_cards(struct island* island, bool animate) {
+  const struct notification_list* list = notifications_get();
+  if (!island->cards_synced) animate = false;
+  island->cards_synced = true;
+
+  // Cards whose notification is gone leave (staggered top to bottom, so
+  // "Read all" sweeps the list).
+  int leaving = 0;
+  for (int i = 0; i < island->card_count; i++) {
+    struct island_card* card = &island->cards[i];
+    if (card->leaving || island_notification_index(card->item.id) >= 0)
+      continue;
+    if (!animate) {
+      card->leave = 1.0;
+    } else {
+      card->leave = -ISLAND_CARD_STAGGER * leaving++;
+    }
+    card->leaving = true;
+  }
+
+  // New notifications get a card, starting a little above their place.
+  for (int i = 0; i < list->count; i++) {
+    bool found = false;
+    for (int j = 0; j < island->card_count; j++) {
+      if (!island->cards[j].leaving
+          && strcmp(island->cards[j].item.id, list->items[i].id) == 0) {
+        island->cards[j].item = list->items[i];
+        found = true;
+        break;
+      }
+    }
+    if (found) continue;
+
+    // Full: make room by dropping the oldest leaving card, if any.
+    if (island->card_count >= ISLAND_CARDS_MAX) {
+      int drop = -1;
+      for (int j = 0; j < island->card_count; j++) {
+        if (island->cards[j].leaving) drop = j;
+      }
+      if (drop < 0) break;
+      island->cards[drop] = island->cards[--island->card_count];
+    }
+
+    struct island_card* card = &island->cards[island->card_count++];
+    memset(card, 0, sizeof(*card));
+    card->item = list->items[i];
+    card->y = island_card_target(i) - (animate ? ISLAND_CARD_ENTER : 0);
+    card->appear = animate ? 0 : 1;
+  }
+
+  if (!animate) island_step_cards(island, 0, true);
+  return animate;
+}
+
+bool island_step_cards(struct island* island, double dt, bool finish) {
+  bool moving = false;
+  double follow = finish ? 1.0 : 1.0 - exp(-dt / ISLAND_CARD_TAU);
+
+  for (int i = 0; i < island->card_count; i++) {
+    struct island_card* card = &island->cards[i];
+    if (card->leaving) {
+      card->leave = finish ? 1.0 : card->leave + dt / ISLAND_CARD_LEAVE;
+      if (card->leave >= 1.0) {
+        island->cards[i--] = island->cards[--island->card_count];
+        continue;
+      }
+      moving = true;
+      continue;
+    }
+
+    card->appear = finish ? 1.0 : min(card->appear + dt / ISLAND_CARD_APPEAR,
+                                      1.0                                  );
+    int index = island_notification_index(card->item.id);
+    CGFloat target = island_card_target(max(index, 0));
+    CGFloat distance = target - card->y;
+    card->y = fabs(distance) < 0.3 ? target : card->y + distance * follow;
+    if (card->appear < 1.0 || card->y != target) moving = true;
+  }
+  return moving;
+}
+
+static CGRect island_card_frame(struct island_layout* layout,
+                                const struct island_card* card,
+                                CGFloat scroll_offset         ) {
+  CGRect list = island_alerts_list(layout);
+  CGFloat top = CGRectGetMaxY(list) - card->y + scroll_offset;
+  return (CGRect){{ list.origin.x, top - ISLAND_CARD_HEIGHT },
+                  { list.size.width, ISLAND_CARD_HEIGHT     }};
+}
+
 static void island_draw_alerts(CGContextRef context,
                                struct island_layout* layout,
                                CGFloat scroll_offset       ) {
-  if (g_notification_count == 0) {
+  const struct notification_list* notifications = notifications_get();
+  if (!notifications->trusted) {
+    island_draw_placeholder(context, layout,
+                            "Allow SketchyBar in Accessibility");
+    return;
+  }
+  struct island* island = g_drawing;
+  if (notifications->count == 0 && (!island || island->card_count == 0)) {
     island_draw_placeholder(context, layout, "No notifications");
     return;
   }
 
+  // Header: count, and the button that marks everything read (not while the
+  // last cards are sliding out).
+  CGRect header = island_alerts_header(layout);
+  if (notifications->count > 0) {
+    char count[24];
+    snprintf(count, sizeof(count), "%d unread", notifications->count);
+    island_draw_text(context, count, g_fonts.caption, 0.55,
+                     header.origin.x, CGRectGetMidY(header) - 3,
+                     header.size.width - ISLAND_READ_ALL_WIDTH - 8,
+                     ALIGN_LEFT                                    );
+    CGRect read_all = island_alerts_read_all(layout);
+    island_draw_glass(context, read_all, read_all.size.height / 2.0, 1.2);
+    island_draw_text(context, "Read all", g_fonts.caption, 0.85,
+                     CGRectGetMidX(read_all), CGRectGetMidY(read_all) - 3,
+                     read_all.size.width, ALIGN_CENTER                    );
+  }
+
+  CGRect list = island_alerts_list(layout);
   CGContextSaveGState(context);
-  CGContextClipToRect(context, layout->list);
-  for (uint32_t i = 0; i < g_notification_count; i++) {
-    CGRect card = island_card_rect(layout, i, scroll_offset);
-    if (!CGRectIntersectsRect(card, layout->list)) continue;
-    island_draw_card(context, &g_notifications[i], card);
+  CGContextClipToRect(context, list);
+  // Leaving cards first, so they fade out behind the ones gliding into
+  // their place.
+  for (int n = 0; island && n < 2 * island->card_count; n++) {
+    const struct island_card* card = &island->cards[n % island->card_count];
+    if (card->leaving != (n < island->card_count)) continue;
+    CGRect frame = island_card_frame(layout, card, scroll_offset);
+
+    // Appearing: fades in while it slides into place. Leaving: slides out
+    // to the right and fades.
+    double alpha = 1.0;
+    if (card->leaving) {
+      double t = island_ease_out(card->leave);
+      alpha = 1.0 - t;
+      frame.origin.x += ISLAND_CARD_EXIT * t;
+    } else {
+      alpha = island_ease_out(card->appear);
+    }
+    if (alpha <= 0 || !CGRectIntersectsRect(frame, list)) continue;
+
+    CGContextSaveGState(context);
+    CGContextSetAlpha(context, alpha);
+    CGContextBeginTransparencyLayer(context, NULL);
+    island_draw_card(context, &card->item, frame);
+    CGContextEndTransparencyLayer(context);
+    CGContextRestoreGState(context);
   }
   CGContextRestoreGState(context);
 
@@ -1887,19 +2264,127 @@ bool island_handle_click(struct island* island,
     return true;
   }
 
-  // Cards swallow clicks for now so that reading them doesn't close the
-  // island. Opening the source app can hook in here later.
+  // Alerts: a card opens its app (and is marked read); "Read all".
   if (island->service == ISLAND_SERVICE_ALERTS
       && CGRectContainsPoint(layout.list, point)) {
-    for (uint32_t i = 0; i < g_notification_count; i++) {
-      if (CGRectContainsPoint(island_card_rect(&layout, i,
-                                               island->scroll_offset),
-                              point                                  ))
-        return true;
+    const struct notification_list* notifications = notifications_get();
+    if (notifications->count > 0
+        && CGRectContainsPoint(CGRectInset(island_alerts_read_all(&layout),
+                                           -3, -3                       ),
+                               point                                     )) {
+      action->type = ISLAND_ACTION_NOTIFICATIONS_READ_ALL;
+      return true;
     }
+    if (!CGRectContainsPoint(island_alerts_list(&layout), point)) return true;
+    // Where the cards are drawn right now; leaving ones can't be clicked.
+    for (int i = 0; i < island->card_count; i++) {
+      const struct island_card* card = &island->cards[i];
+      if (card->leaving) continue;
+      if (!CGRectContainsPoint(island_card_frame(&layout, card,
+                                                 island->scroll_offset),
+                               point                                   )) {
+        continue;
+      }
+      int index = island_notification_index(card->item.id);
+      if (index < 0) return true;
+      action->type = ISLAND_ACTION_NOTIFICATION_OPEN;
+      action->index = index;
+      return true;
+    }
+    return true;
   }
 
   return false;
+}
+
+// ---------------------------------------------------------------- peek
+
+static CGFloat island_text_width(const char* text, CTFontRef font) {
+  if (!text || !font) return 0;
+  CFStringRef string = CFStringCreateWithCString(NULL, text,
+                                                 kCFStringEncodingUTF8);
+  if (!string) return 0;
+  const void* keys[] = { kCTFontAttributeName };
+  const void* values[] = { font };
+  CFDictionaryRef attributes = CFDictionaryCreate(NULL, keys, values, 1,
+                                         &kCFTypeDictionaryKeyCallBacks,
+                                         &kCFTypeDictionaryValueCallBacks);
+  CFAttributedStringRef attributed = CFAttributedStringCreate(NULL, string,
+                                                              attributes  );
+  CTLineRef line = CTLineCreateWithAttributedString(attributed);
+  CGFloat width = CTLineGetTypographicBounds(line, NULL, NULL, NULL);
+  CFRelease(line);
+  CFRelease(attributed);
+  CFRelease(attributes);
+  CFRelease(string);
+  return ceil(width);
+}
+
+CGFloat island_peek_text(const struct notification_item* item,
+                         char* out,
+                         size_t size                          ) {
+  char full[512];
+  if (item->title[0] && item->body[0])
+    snprintf(full, sizeof(full), "%s: %s", item->title, item->body);
+  else
+    snprintf(full, sizeof(full), "%s", item->title[0] ? item->title
+                                                      : item->body );
+
+  // At most ISLAND_PEEK_CHARS characters (whole ones: emoji, accents), then
+  // "...".
+  snprintf(out, size, "%s", full);
+  CFStringRef string = CFStringCreateWithCString(NULL, full,
+                                                 kCFStringEncodingUTF8);
+  if (string) {
+    CFIndex length = CFStringGetLength(string);
+    CFIndex end = 0;
+    int characters = 0;
+    while (end < length && characters < ISLAND_PEEK_CHARS) {
+      CFRange range = CFStringGetRangeOfComposedCharactersAtIndex(string, end);
+      end = range.location + range.length;
+      characters++;
+    }
+    if (end < length) {
+      CFStringRef cut = CFStringCreateWithSubstring(NULL, string,
+                                                    CFRangeMake(0, end));
+      char prefix[512];
+      if (cut && CFStringGetCString(cut, prefix, sizeof(prefix),
+                                    kCFStringEncodingUTF8       )) {
+        snprintf(out, size, "%s...", prefix);
+      }
+      if (cut) CFRelease(cut);
+    }
+    CFRelease(string);
+  }
+  return island_text_width(out, g_fonts.peek);
+}
+
+void island_draw_peek(CGContextRef context,
+                      const struct notification_item* item,
+                      const char* text,
+                      CGRect icon,
+                      CGRect text_rect,
+                      double alpha                       ) {
+  if (!g_loaded || alpha <= 0) return;
+  CGContextSaveGState(context);
+  CGContextSetAlpha(context, max(min(alpha, 1.0), 0.0));
+
+  island_draw_app_icon(context, item->app, icon);
+  CGFloat baseline = CGRectGetMidY(text_rect)
+                     - (CTFontGetAscent(g_fonts.peek)
+                        - CTFontGetDescent(g_fonts.peek)) / 2.0;
+  island_draw_text(context, text, g_fonts.peek, 0.95,
+                   text_rect.origin.x, baseline,
+                   text_rect.size.width + 1, ALIGN_LEFT);
+  CGContextRestoreGState(context);
+}
+
+void island_clamp_scroll(struct island* island, CGRect panel) {
+  if (!g_loaded || island->service != ISLAND_SERVICE_ALERTS) return;
+  struct island_layout layout = island_get_layout(panel);
+  CGFloat max_scroll = island_max_scroll(&layout);
+  island->scroll_target = max(min(island->scroll_target, max_scroll), 0);
+  island->scroll_offset = max(min(island->scroll_offset, max_scroll), 0);
 }
 
 bool island_handle_scroll(struct island* island,

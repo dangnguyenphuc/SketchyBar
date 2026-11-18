@@ -6,6 +6,7 @@
 #include "system_info.h"
 #include "connections.h"
 #include "desktops.h"
+#include "notifications.h"
 
 // Content drawn inside the expanded notch island: a services column on the
 // left, a divider, and the selected service's panel on the right (for Alerts:
@@ -22,6 +23,19 @@ enum island_service {
   ISLAND_SERVICE_BLUETOOTH,
   ISLAND_SERVICE_SCREENS,
   ISLAND_SERVICE_COUNT
+};
+
+// A card of the Alerts tab as drawn: the notification (a copy, so it can
+// still be drawn while leaving), its animated position (points from the top
+// of the list), and how far it has appeared (0..1) or left (0..1).
+#define ISLAND_CARDS_MAX (NOTIFICATIONS_MAX + 16)
+
+struct island_card {
+  struct notification_item item;
+  CGFloat y;
+  double appear;
+  double leave;
+  bool leaving;
 };
 
 // Per-bar UI state. Kept across open/close, except the scroll position.
@@ -51,6 +65,12 @@ struct island {
   // false: not synced yet, jump instead of animating.
   double toggle_progress[2];
   bool toggles_ready;
+
+  // Alerts tab cards (see island_sync_cards). `cards_synced` false: the next
+  // sync places them without animating (just opened).
+  struct island_card cards[ISLAND_CARDS_MAX];
+  int card_count;
+  bool cards_synced;
 };
 
 enum { ISLAND_TOGGLE_WIFI, ISLAND_TOGGLE_BLUETOOTH };
@@ -97,14 +117,17 @@ enum island_action_type {
   ISLAND_ACTION_BLUETOOTH_SETTINGS,
   ISLAND_ACTION_BLUETOOTH_SELECT,
   ISLAND_ACTION_SCREEN_SELECT,
-  ISLAND_ACTION_SET_BRIGHTNESS
+  ISLAND_ACTION_SET_BRIGHTNESS,
+  ISLAND_ACTION_NOTIFICATION_OPEN,
+  ISLAND_ACTION_NOTIFICATIONS_READ_ALL
 };
 
 struct island_action {
   enum island_action_type type;
   float value;   // SET_VOLUME / SET_BRIGHTNESS: 0..1
   int index;     // BLUETOOTH_SELECT: index into the device list;
-                 // SCREEN_SELECT: the desktop
+                 // SCREEN_SELECT: the desktop; NOTIFICATION_OPEN: index
+                 // into the captured notifications
 };
 
 // `family` is the text font family (the bar's default font); NULL uses the
@@ -131,6 +154,32 @@ void island_draw_band(struct island* island,
                       CGRect right,
                       const struct island_data* data,
                       double progress                  );
+
+// Peek: the newest notification shown in the closed island (collapsed
+// height, widened beside the camera: app icon left, text right).
+// island_peek_text builds the text ("Title: body", at most ISLAND_PEEK_CHARS
+// characters, then "...") into `out` and returns its width in the peek font.
+// Both need the fonts, i.e. island_open().
+#define ISLAND_PEEK_CHARS 50
+CGFloat island_peek_text(const struct notification_item* item,
+                         char* out,
+                         size_t size                          );
+void island_draw_peek(CGContextRef context,
+                      const struct notification_item* item,
+                      const char* text,
+                      CGRect icon,
+                      CGRect text_rect,
+                      double alpha                       );
+
+// Alerts cards: island_sync_cards matches the drawn cards to the captured
+// notifications (new ones slide in, gone ones slide out) and returns whether
+// anything needs to animate; island_step_cards advances that by `dt`
+// seconds and returns whether it is still moving (`finish` settles it).
+bool island_sync_cards(struct island* island, bool animate);
+bool island_step_cards(struct island* island, double dt, bool finish);
+
+// Keeps the scroll position within the list after it got shorter.
+void island_clamp_scroll(struct island* island, CGRect panel);
 
 // Return true if the event was consumed by the island content. Clicks and
 // drags report what to do in `action` (ISLAND_ACTION_NONE if nothing).

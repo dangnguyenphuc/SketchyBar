@@ -17,6 +17,17 @@
 #define BAR_TOGGLE_DURATION       14
 #define BAR_TOGGLE_PENDING        5.0
 
+// Peek timing: grows in BAR_PEEK_DURATION frames (60Hz), holds for
+// BAR_PEEK_HOLD seconds, shrinks in BAR_PEEK_DURATION frames: 3s in total.
+// Layout: padding around the app icon and the text beside the camera.
+// Alerts card animations are driven for at most this many frames (60Hz).
+#define BAR_CARDS_FRAMES          40
+
+#define BAR_PEEK_DURATION         15
+#define BAR_PEEK_HOLD             2.5
+#define BAR_PEEK_PADDING          10
+#define BAR_PEEK_ICON             22
+
 // System Settings pages behind the settings buttons.
 #define BAR_WIFI_SETTINGS_URL \
   "x-apple.systempreferences:com.apple.wifi-settings-extension"
@@ -68,7 +79,19 @@ struct bar {
   // System tab: this display's brightness, read while the tab is shown.
   bool has_brightness;
   float brightness;
+
+  // Peek: a new notification while the island is closed. The island keeps
+  // its collapsed height and widens beside the camera (`peek_left` points for
+  // the app icon, `peek_right` for the text); `peek_progress` animates it.
+  bool peeking;
+  int peek_progress;
+  CGFloat peek_left;
+  CGFloat peek_right;
+  uint64_t peek_token;
+  struct notification_item peek_item;
+  char peek_text[256];
   uint64_t scroll_glide_time;
+  uint64_t cards_time;
   CFAbsoluteTime island_activity;
 };
 
