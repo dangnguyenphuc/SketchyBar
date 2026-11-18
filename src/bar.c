@@ -6,7 +6,6 @@
 #include "window.h"
 #include "mouse.h"
 #include "stats.h"
-#include "password_field.h"
 
 extern int workspace_display_notch_height(uint32_t did);
 extern int workspace_display_notch_width(uint32_t did);
@@ -169,33 +168,16 @@ static double bar_progress_fraction(int progress) {
   return t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
 }
 
-// Size of the visible notch shape for an expand progress and a widen
-// progress (Wi-Fi prompt).
-static CGSize bar_get_shape_size_wide(struct bar* bar,
-                                      int progress,
-                                      int wide_progress) {
+// Size of the visible notch shape for a given expand progress.
+static CGSize bar_get_shape_size(struct bar* bar, int progress) {
   double t = bar_progress_fraction(progress);
-  double expanded_width = BAR_NOTCH_EXPANDED_WIDTH
-                          + (BAR_NOTCH_WIDE_WIDTH - BAR_NOTCH_EXPANDED_WIDTH)
-                            * bar_progress_fraction(wide_progress);
-
   double collapsed_height = bar_collapsed_height(bar);
   return (CGSize){
     round(BAR_NOTCH_COLLAPSED_WIDTH
-          + (expanded_width - BAR_NOTCH_COLLAPSED_WIDTH) * t),
+          + (BAR_NOTCH_EXPANDED_WIDTH - BAR_NOTCH_COLLAPSED_WIDTH) * t),
     round(collapsed_height
           + (BAR_NOTCH_EXPANDED_HEIGHT - collapsed_height) * t)
   };
-}
-
-static CGSize bar_get_shape_size(struct bar* bar, int progress) {
-  return bar_get_shape_size_wide(bar, progress, bar->wide_progress);
-}
-
-// Like the expand animation, widening keeps the window at the wide size for
-// the whole animation and only changes the drawn shape.
-static bool bar_uses_wide_window(struct bar* bar) {
-  return bar->wide || bar->wide_progress > 0;
 }
 
 // While expanded or animating, the window keeps the full expanded size and
@@ -224,9 +206,9 @@ static CGRect bar_get_shape_bounds(struct bar* bar) {
   return frame;
 }
 
-// The fully expanded shape at the current width (window-local, y-up): what
-// the content is laid out in. It stays put during the expand animation
-// (the shape only clips it) and follows the widening for the Wi-Fi prompt.
+// The fully expanded shape (window-local, y-up): what the content is laid
+// out in. It stays put during the expand animation (the shape only clips
+// it).
 static CGRect bar_get_layout_bounds(struct bar* bar) {
   CGRect frame = bar->window.frame;
   CGSize size = bar_get_shape_size(bar, BAR_EXPAND_PROGRESS_MAX);
@@ -279,42 +261,39 @@ static struct island_data bar_island_data() {
                                .connections = connections_get() };
 }
 
-static void bar_island_open_prompt(struct bar* bar, const char* ssid);
-static void bar_island_close_prompt(struct bar* bar);
 static void bar_island_update_sources();
 static void bar_island_update_desktops(struct bar* bar);
 static void bar_island_update_brightness(struct bar* bar);
 static void bar_click_toggle(struct bar* bar, int column);
 static void bar_sync_toggles(struct bar* bar);
 static void bar_island_connections_changed(void);
-static void bar_island_join(struct bar* bar, const char* password);
+
+// Opens a System Settings page (an x-apple.systempreferences: URL).
+static void bar_open_url(const char* string) {
+  CFURLRef url = CFURLCreateWithBytes(NULL, (const UInt8*)string,
+                                      strlen(string),
+                                      kCFStringEncodingUTF8, NULL);
+  if (!url) return;
+  LSOpenCFURLRef(url, NULL);
+  CFRelease(url);
+}
 
 // Runs what an input event on the island content asked for.
 static void bar_island_perform(struct bar* bar, struct island_action* action) {
   const struct connections* connections = connections_get();
   switch (action->type) {
     case ISLAND_ACTION_WIFI_POWER:
-      bar_click_toggle(bar, 0);
+      bar_click_toggle(bar, ISLAND_TOGGLE_WIFI);
+      break;
+    case ISLAND_ACTION_WIFI_SETTINGS:
+      bar_open_url(BAR_WIFI_SETTINGS_URL);
       break;
     case ISLAND_ACTION_BLUETOOTH_POWER:
-      bar_click_toggle(bar, 1);
+      bar_click_toggle(bar, ISLAND_TOGGLE_BLUETOOTH);
       break;
-    case ISLAND_ACTION_WIFI_SELECT: {
-      if (action->index < 0 || action->index >= connections->wifi_count
-          || connections->status == CONNECTION_CONNECTING              ) {
-        break;
-      }
-      struct wifi_network network = connections->wifi[action->index];
-      if (network.current) break;
-
-      // New secured networks (and saved ones that failed) ask for the
-      // password first; open and saved ones are joined right away.
-      if (connections_wifi_needs_password(&network))
-        bar_island_open_prompt(bar, network.ssid);
-      else
-        connections_join_wifi(network.ssid, NULL);
+    case ISLAND_ACTION_BLUETOOTH_SETTINGS:
+      bar_open_url(BAR_BLUETOOTH_SETTINGS_URL);
       break;
-    }
     case ISLAND_ACTION_BLUETOOTH_SELECT:
       if (action->index < 0 || action->index >= connections->bluetooth_count
           || connections->status == CONNECTION_CONNECTING                   ) {
@@ -322,15 +301,6 @@ static void bar_island_perform(struct bar* bar, struct island_action* action) {
       }
       connections_toggle_bluetooth(connections->bluetooth[action->index]
                                                 .address              );
-      break;
-    case ISLAND_ACTION_PROMPT_JOIN:
-      // The field calls back with its text (bar_island_password_done).
-      if (password_field_visible()) password_field_submit();
-      else bar_island_join(bar, connections_wifi_password(
-                                  bar->island.prompt_ssid ));
-      break;
-    case ISLAND_ACTION_PROMPT_CANCEL:
-      bar_island_close_prompt(bar);
       break;
     case ISLAND_ACTION_SCREEN_SELECT:
       // Desktops that don't exist, or the current one, do nothing. The
@@ -491,12 +461,12 @@ bool bar_island_click(struct bar* bar, CGPoint point) {
   bar_island_perform(bar, &action);
 
   if (bar->island.service != service) {
-    // Leaving the Connections tab drops an open Wi-Fi prompt.
-    if (service == ISLAND_SERVICE_CONNECTIONS) bar_island_close_prompt(bar);
     bar_animate_island_transition(bar);
     bar_island_update_sources();
-    if (bar->island.service == ISLAND_SERVICE_CONNECTIONS)
+    if (bar->island.service == ISLAND_SERVICE_BLUETOOTH
+        || bar->island.service == ISLAND_SERVICE_SYSTEM) {
       bar_sync_toggles(bar);
+    }
     if (bar->island.service == ISLAND_SERVICE_SCREENS)
       bar_island_update_desktops(bar);
     if (bar->island.service == ISLAND_SERVICE_SYSTEM)
@@ -961,13 +931,9 @@ static CGRect bar_get_frame(struct bar *bar) {
                      {g_bar_manager.background.bounds.size.height,
                       bounds.size.height                          }};
   } else {
-    CGSize size = bar_get_shape_size_wide(bar,
-                                          bar_uses_expanded_window(bar)
+    CGSize size = bar_get_shape_size(bar, bar_uses_expanded_window(bar)
                                           ? BAR_EXPAND_PROGRESS_MAX
-                                          : 0,
-                                          bar_uses_wide_window(bar)
-                                          ? BAR_EXPAND_PROGRESS_MAX
-                                          : 0                          );
+                                          : 0                       );
 
     // Centered on the display (keeps the display's own x origin, so this also
     // works on secondary monitors).
@@ -1050,8 +1016,7 @@ static void bar_island_idle_handler(CFRunLoopTimerRef timer, void* context) {
     if (!bar || !bar->expanded) continue;
 
     // Hovering counts as interaction for as long as it lasts.
-    // So does an open Wi-Fi prompt (typing goes to the text field).
-    if (bar->mouse_over || bar->island.prompt) bar->island_activity = now;
+    if (bar->mouse_over) bar->island_activity = now;
     else if (now - bar->island_activity >= BAR_ISLAND_IDLE_TIMEOUT - 0.05)
       bar_toggle_expanded(bar);
   }
@@ -1097,9 +1062,18 @@ static void bar_island_stats_handler(CFRunLoopTimerRef timer, void* context) {
   windows_unfreeze();
 }
 
-// Now playing / audio output changed (main thread).
+// A source of the island changed (main thread): keep the switches in step
+// with the real Wi-Fi/Bluetooth state, then redraw.
 static void bar_island_sources_changed(void) {
   if (!bar_any_expanded()) return;
+  for (int i = 0; i < g_bar_manager.bar_count; i++) {
+    struct bar* bar = g_bar_manager.bars[i];
+    if (bar && bar->expanded
+        && (bar->island.service == ISLAND_SERVICE_SYSTEM
+            || bar->island.service == ISLAND_SERVICE_BLUETOOTH)) {
+      bar_sync_toggles(bar);
+    }
+  }
   g_bar_manager.bar_needs_update = true;
   bar_manager_refresh(&g_bar_manager, false);
   windows_unfreeze();
@@ -1123,135 +1097,6 @@ static void bar_start_stats_history() {
   CFRunLoopAddTimer(CFRunLoopGetMain(), g_stats_timer, kCFRunLoopCommonModes);
 }
 
-// ------------------------------------------------------------ wifi prompt
-// The bar whose Wi-Fi prompt owns the password field.
-static struct bar* g_prompt_bar = NULL;
-
-static bool bar_is_alive(struct bar* bar) {
-  for (int i = 0; i < g_bar_manager.bar_count; i++) {
-    if (g_bar_manager.bars[i] == bar) return true;
-  }
-  return false;
-}
-
-static void bar_island_redraw() {
-  g_bar_manager.bar_needs_update = true;
-  bar_manager_refresh(&g_bar_manager, false);
-  windows_unfreeze();
-}
-
-static void bar_island_join(struct bar* bar, const char* password) {
-  bar->island.prompt_joining = true;
-  password_field_hide();
-  connections_join_wifi(bar->island.prompt_ssid,
-                        password && password[0] ? password : NULL);
-  g_bar_manager.bar_needs_update = true;
-}
-
-// Return (submitted) or Escape in the password field.
-static void bar_island_password_done(bool submitted, const char* password) {
-  struct bar* bar = g_prompt_bar;
-  if (!bar || !bar_is_alive(bar) || !bar->island.prompt) return;
-
-  if (submitted) bar_island_join(bar, password);
-  else bar_island_close_prompt(bar);
-  bar_island_redraw();
-}
-
-// Lays the real text field over the drawn one, pre-filled with the password
-// that was tried last for this network.
-static void bar_island_show_password_field(struct bar* bar) {
-  if (!bar->island.prompt || bar->island.prompt_joining) return;
-
-  CGRect local = island_prompt_field_rect(&bar->island,
-                                          bar_get_island_panel(bar));
-  CGRect global = {{ bar->window.origin.x + local.origin.x,
-                     bar->window.origin.y + bar->window.frame.size.height
-                     - CGRectGetMaxY(local)                             },
-                   local.size                                             };
-  g_prompt_bar = bar;
-  password_field_show(global,
-                      connections_wifi_password(bar->island.prompt_ssid),
-                      bar_island_password_done                          );
-}
-
-static bool bar_set_wide_progress(void* target, int value) {
-  struct bar* bar = target;
-  if (bar->wide_progress == value) return false;
-  bar->wide_progress = value;
-  bar->island.prompt_progress = bar_progress_fraction(value);
-
-  if (value == 0 && !bar->wide) {
-    bar->island.prompt = false;
-    bar->island.prompt_joining = false;
-  }
-
-  // Shrinks the window back once the island is narrow again.
-  bar_resize(bar);
-  g_bar_manager.bar_needs_update = true;
-
-  // The field can only be placed once the island stopped moving.
-  if (value == BAR_EXPAND_PROGRESS_MAX && bar->wide)
-    bar_island_show_password_field(bar);
-  return true;
-}
-
-static void bar_cancel_wide(struct bar* bar) {
-  animator_cancel_locked(&g_bar_manager.animator,
-                         bar,
-                         (animator_function*)bar_set_wide_progress);
-}
-
-static void bar_animate_wide(struct bar* bar) {
-  bar_cancel_wide(bar);
-
-  bool needs_refresh = false;
-  uint32_t saved_duration = g_bar_manager.animator.duration;
-  char saved_interp = g_bar_manager.animator.interp_function;
-  g_bar_manager.animator.duration = BAR_WIDE_DURATION;
-  g_bar_manager.animator.interp_function = INTERP_FUNCTION_SIN;
-
-  ANIMATE(bar_set_wide_progress,
-          bar,
-          bar->wide_progress,
-          bar->wide ? BAR_EXPAND_PROGRESS_MAX : 0);
-  animator_lock(&g_bar_manager.animator);
-
-  g_bar_manager.animator.duration = saved_duration;
-  g_bar_manager.animator.interp_function = saved_interp;
-  (void)needs_refresh;
-}
-
-// Widens the island, fades the Bluetooth column out and the prompt in. With
-// a prompt already open it just switches to the other network.
-static void bar_island_open_prompt(struct bar* bar, const char* ssid) {
-  struct island* island = &bar->island;
-  snprintf(island->prompt_ssid, sizeof(island->prompt_ssid), "%s", ssid);
-  island->prompt = true;
-  island->prompt_joining = false;
-
-  if (!bar->wide) {
-    bar->wide = true;
-    // Grow the window first, so the animation never resizes it.
-    bar_resize(bar);
-    bar_animate_wide(bar);
-  } else if (bar->wide_progress == BAR_EXPAND_PROGRESS_MAX) {
-    bar_island_show_password_field(bar);
-  }
-  g_bar_manager.bar_needs_update = true;
-}
-
-static void bar_island_close_prompt(struct bar* bar) {
-  if (g_prompt_bar == bar) {
-    password_field_hide();
-    g_prompt_bar = NULL;
-  }
-  if (!bar->wide) return;
-  bar->wide = false;
-  bar_animate_wide(bar);
-  g_bar_manager.bar_needs_update = true;
-}
-
 // ------------------------------------------------------------ switches
 // A clicked switch flips right away (optimistic) and keeps that until the
 // real state catches up, or BAR_TOGGLE_PENDING seconds passed.
@@ -1259,8 +1104,8 @@ static int g_toggle_pending[2] = { -1, -1 };
 static CFAbsoluteTime g_toggle_pending_since[2];
 
 static bool bar_toggle_actual(int column) {
-  const struct connections* connections = connections_get();
-  return column == 0 ? connections->wifi_on : connections->bluetooth_on;
+  return column == ISLAND_TOGGLE_WIFI ? system_info_get()->wifi_on
+                                      : connections_get()->bluetooth_on;
 }
 
 static bool bar_toggle_desired(int column) {
@@ -1345,7 +1190,7 @@ static void bar_click_toggle(struct bar* bar, int column) {
   g_toggle_pending[column] = on;
   g_toggle_pending_since[column] = CFAbsoluteTimeGetCurrent();
 
-  if (column == 0) connections_set_wifi_power(on);
+  if (column == ISLAND_TOGGLE_WIFI) system_info_set_wifi_power(on);
   else connections_set_bluetooth_power(on);
   bar_sync_toggles(bar);
 
@@ -1357,24 +1202,8 @@ static void bar_click_toggle(struct bar* bar, int column) {
                  ^{ bar_island_connections_changed(); });
 }
 
-// A submitted prompt closes once its result was shown (the notice clears).
+// Bluetooth state or a connect result changed.
 static void bar_island_connections_changed(void) {
-  const struct connections* connections = connections_get();
-  for (int i = 0; i < g_bar_manager.bar_count; i++) {
-    struct bar* bar = g_bar_manager.bars[i];
-    if (bar && bar->expanded
-        && bar->island.service == ISLAND_SERVICE_CONNECTIONS) {
-      bar_sync_toggles(bar);
-    }
-  }
-
-  for (int i = 0; i < g_bar_manager.bar_count; i++) {
-    struct bar* bar = g_bar_manager.bars[i];
-    if (bar && bar->island.prompt && bar->island.prompt_joining
-        && connections->status == CONNECTION_IDLE                ) {
-      bar_island_close_prompt(bar);
-    }
-  }
   bar_island_sources_changed();
 }
 
@@ -1393,12 +1222,12 @@ static void bar_island_update_sources() {
     system_info_stop();
   }
 
-  // Wi-Fi/Bluetooth only while their tab is showing.
+  // Bluetooth only while its tab is showing.
   bool connections = false;
   for (int i = 0; i < g_bar_manager.bar_count; i++) {
     struct bar* bar = g_bar_manager.bars[i];
     if (bar && bar->expanded
-        && bar->island.service == ISLAND_SERVICE_CONNECTIONS) {
+        && bar->island.service == ISLAND_SERVICE_BLUETOOTH) {
       connections = true;
     }
   }
@@ -1414,7 +1243,6 @@ void bar_toggle_expanded(struct bar* bar) {
   bar->expanded = !bar->expanded;
   bar_cancel_island_scroll(bar);
   bar_cancel_island_transition(bar);
-  if (!bar->expanded) bar_island_close_prompt(bar);
   if (bar->expanded) {
     island_open(&bar->island,
                 g_bar_manager.default_item.label.font.family);
@@ -1506,12 +1334,7 @@ void bar_destroy(struct bar *bar) {
                          (animator_function*)bar_set_expand_progress);
   bar_cancel_island_scroll(bar);
   bar_cancel_island_transition(bar);
-  bar_cancel_wide(bar);
   bar_cancel_toggles(bar);
-  if (g_prompt_bar == bar) {
-    password_field_hide();
-    g_prompt_bar = NULL;
-  }
   window_close(&bar->window);
   free(bar);
 }

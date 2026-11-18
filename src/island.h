@@ -19,14 +19,15 @@ enum island_service {
   ISLAND_SERVICE_ALERTS,
   ISLAND_SERVICE_MUSIC,
   ISLAND_SERVICE_SYSTEM,
-  ISLAND_SERVICE_CONNECTIONS,
+  ISLAND_SERVICE_BLUETOOTH,
   ISLAND_SERVICE_SCREENS,
   ISLAND_SERVICE_COUNT
 };
 
 // Per-bar UI state. Kept across open/close, except the scroll position.
 // Scroll input only moves `scroll_target`; the bar animates `scroll_offset`
-// (what is drawn) towards it on the display link.
+// (what is drawn) towards it on the display link. The scrolling page (the
+// Alerts list or the Bluetooth device list) uses it.
 //
 // Services behave like stacked pages: switching runs `transition` 0 -> 1
 // while the page of `previous_service` slides out and the new one slides in
@@ -45,22 +46,14 @@ struct island {
   bool dragging_volume;
   bool dragging_brightness;
 
-  // Connections tab: scroll offsets of the Wi-Fi and Bluetooth lists, and
-  // the on/off switches' positions (0 off .. 1 on, animated by the bar).
-  // `toggles_ready` false: not synced yet, jump instead of animating.
-  CGFloat column_scroll[2];
+  // On/off switches (ISLAND_TOGGLE_*: Wi-Fi in the System tab, Bluetooth in
+  // its tab): positions 0 off .. 1 on, animated by the bar. `toggles_ready`
+  // false: not synced yet, jump instead of animating.
   double toggle_progress[2];
   bool toggles_ready;
-
-  // Wi-Fi password prompt. While `prompt` is set the bar widens the island
-  // (`prompt_progress` 0 -> 1): the Bluetooth column fades out and the prompt
-  // fades in in its place. `prompt_joining`: submitted, the join attempt and
-  // then its result are shown until the bar closes the prompt.
-  bool prompt;
-  bool prompt_joining;
-  double prompt_progress;
-  char prompt_ssid[CONNECTIONS_NAME];
 };
+
+enum { ISLAND_TOGGLE_WIFI, ISLAND_TOGGLE_BLUETOOTH };
 
 // Live data shown in the island, owned by the bar (only valid while open).
 struct island_data {
@@ -99,11 +92,10 @@ enum island_action_type {
   ISLAND_ACTION_TOGGLE_MUTE,
   ISLAND_ACTION_SET_VOLUME,
   ISLAND_ACTION_WIFI_POWER,
+  ISLAND_ACTION_WIFI_SETTINGS,
   ISLAND_ACTION_BLUETOOTH_POWER,
-  ISLAND_ACTION_WIFI_SELECT,
+  ISLAND_ACTION_BLUETOOTH_SETTINGS,
   ISLAND_ACTION_BLUETOOTH_SELECT,
-  ISLAND_ACTION_PROMPT_JOIN,
-  ISLAND_ACTION_PROMPT_CANCEL,
   ISLAND_ACTION_SCREEN_SELECT,
   ISLAND_ACTION_SET_BRIGHTNESS
 };
@@ -111,8 +103,8 @@ enum island_action_type {
 struct island_action {
   enum island_action_type type;
   float value;   // SET_VOLUME / SET_BRIGHTNESS: 0..1
-  int index;     // *_SELECT: index into the Wi-Fi / Bluetooth list, or
-                 // the desktop (SCREEN_SELECT)
+  int index;     // BLUETOOTH_SELECT: index into the device list;
+                 // SCREEN_SELECT: the desktop
 };
 
 // `family` is the text font family (the bar's default font); NULL uses the
@@ -139,10 +131,6 @@ void island_draw_band(struct island* island,
                       CGRect right,
                       const struct island_data* data,
                       double progress                  );
-
-// Where the Wi-Fi prompt's password field is (window-local, y-up), for the
-// bar to lay the real text field over it.
-CGRect island_prompt_field_rect(struct island* island, CGRect panel);
 
 // Return true if the event was consumed by the island content. Clicks and
 // drags report what to do in `action` (ISLAND_ACTION_NONE if nothing).

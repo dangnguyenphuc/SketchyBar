@@ -47,18 +47,17 @@
 #define ISLAND_GRAPH_HEADER   19
 #define ISLAND_GRAPH_LINE     1.25
 
-// Connections tab: two columns (Wi-Fi, Bluetooth) with a header each, rows
-// below; the password prompt's field and buttons; the result banner.
-#define ISLAND_COLUMN_WIDTH   112
-#define ISLAND_COLUMN_GAP     8
+// Bluetooth tab: a header, device rows below, the result banner. Switches
+// and settings buttons (Bluetooth header, System tab's Wi-Fi row).
 #define ISLAND_COLUMN_HEADER  18
 #define ISLAND_ROW_HEIGHT     19
 #define ISLAND_TOGGLE_WIDTH   22
 #define ISLAND_TOGGLE_HEIGHT  12
 // How much wider the switch knob gets halfway through its slide.
 #define ISLAND_TOGGLE_STRETCH 5
-#define ISLAND_FIELD_HEIGHT   22
-#define ISLAND_BUTTON_HEIGHT  20
+#define ISLAND_SETTINGS_SIZE  16
+#define ISLAND_BATTERY_ICON   16
+#define ISLAND_CONTROL_GAP    8
 #define ISLAND_NOTICE_BAR     22
 
 // Screens tab: 3 x 2 tiles, the hint line below them when switching can't
@@ -114,7 +113,7 @@ static const struct {
   [ISLAND_SERVICE_ALERTS]   = { "\xEF\x83\xB3", "A" },  // U+F0F3
   [ISLAND_SERVICE_MUSIC]    = { "\xEF\x80\x81", "M" },  // U+F001
   [ISLAND_SERVICE_SYSTEM]   = { "\xEF\x87\xBE", "S" },  // U+F1FE area-chart
-  [ISLAND_SERVICE_CONNECTIONS] = { "\xEF\x87\xAB", "W" },  // U+F1EB wifi
+  [ISLAND_SERVICE_BLUETOOTH] = { "\xEF\x8A\x93", "B" },  // U+F293 bluetooth
   [ISLAND_SERVICE_SCREENS]  = { "\xEF\x80\x89", "D" },  // U+F009 th-large
 };
 
@@ -138,7 +137,9 @@ enum island_glyph {
   GLYPH_VOLUME, GLYPH_VOLUME_LOW, GLYPH_MUTED,
   GLYPH_APPLE, GLYPH_WIFI, GLYPH_ETHERNET,
   GLYPH_BLUETOOTH, GLYPH_LOCK, GLYPH_CHECK, GLYPH_CROSS, GLYPH_BACK,
-  GLYPH_SUN, GLYPH_COUNT
+  GLYPH_SUN, GLYPH_SETTINGS,
+  GLYPH_BATTERY_0, GLYPH_BATTERY_1, GLYPH_BATTERY_2, GLYPH_BATTERY_3,
+  GLYPH_BATTERY_4, GLYPH_COUNT
 };
 static const struct {
   const char* glyph;
@@ -160,6 +161,12 @@ static const struct {
   [GLYPH_CROSS]      = { "\xEF\x80\x8D", "x"  },  // U+F00D times
   [GLYPH_BACK]       = { "\xEF\x81\x93", "<"  },  // U+F053 chevron-left
   [GLYPH_SUN]        = { "\xEF\x86\x85", "*"  },  // U+F185 sun
+  [GLYPH_SETTINGS]   = { "\xEF\x80\x93", "S"  },  // U+F013 cog
+  [GLYPH_BATTERY_0]  = { "\xEF\x89\x84", "["  },  // U+F244 battery-empty
+  [GLYPH_BATTERY_1]  = { "\xEF\x89\x83", "["  },  // U+F243 battery-quarter
+  [GLYPH_BATTERY_2]  = { "\xEF\x89\x82", "["  },  // U+F242 battery-half
+  [GLYPH_BATTERY_3]  = { "\xEF\x89\x81", "["  },  // U+F241 battery-3/4
+  [GLYPH_BATTERY_4]  = { "\xEF\x89\x80", "["  },  // U+F240 battery-full
 };
 static const char* g_glyphs[GLYPH_COUNT];
 
@@ -271,10 +278,6 @@ void island_open(struct island* island, const char* family) {
   island->previous_service = island->service;
   island->previous_scroll_offset = 0;
   island->transition = 1.0;
-  island->column_scroll[0] = island->column_scroll[1] = 0;
-  island->prompt = false;
-  island->prompt_joining = false;
-  island->prompt_progress = 0;
   island->toggles_ready = false;
   if (g_loaded) return;
 
@@ -899,6 +902,59 @@ static void island_draw_music(CGContextRef context,
   }
 }
 
+// ---------------------------------------------------------------- controls
+
+// An on/off switch at `progress` (0 off, 1 on; in between while it moves):
+// the track fades from grey to green and the knob slides over, stretching a
+// little on the way like a drop of liquid.
+static void island_draw_toggle(CGContextRef context,
+                               CGRect rect,
+                               double progress     ) {
+  CGFloat t = max(min(progress, 1.0), 0.0);
+  CGFloat radius = rect.size.height / 2.0;
+
+  island_add_rounded_rect(context, rect, radius);
+  island_set_fill(context, ISLAND_COLOR_WHITE, 0.2);
+  CGContextFillPath(context);
+  if (t > 0) {
+    island_add_rounded_rect(context, rect, radius);
+    island_set_fill(context, ISLAND_COLOR_GREEN, t);
+    CGContextFillPath(context);
+  }
+
+  CGFloat knob = rect.size.height - 2;
+  CGFloat stretch = ISLAND_TOGGLE_STRETCH * sin(M_PI * t);
+  CGFloat travel = rect.size.width - knob - 2;
+  CGRect pill = {{ rect.origin.x + 1 + travel * t - stretch * t,
+                   rect.origin.y + 1                          },
+                 { knob + stretch, knob }};
+  island_add_rounded_rect(context, pill, knob / 2.0);
+  island_set_fill(context, ISLAND_COLOR_WHITE, 0.95);
+  CGContextFillPath(context);
+}
+
+// Small round button with a gear: opens the matching System Settings page.
+static void island_draw_settings_button(CGContextRef context, CGRect rect) {
+  island_draw_glass(context, rect, rect.size.width / 2.0, 1.0);
+  island_draw_glyph(context, g_glyphs[GLYPH_SETTINGS], g_fonts.caption,
+                    ISLAND_COLOR_WHITE, 0.8, rect                       );
+}
+
+// The switch and the settings button left of it, right-aligned in a row
+// whose vertical center is `mid`.
+static void island_controls_rects(CGFloat right,
+                                  CGFloat mid,
+                                  CGRect* toggle,
+                                  CGRect* settings) {
+  *toggle = (CGRect){{ right - ISLAND_TOGGLE_WIDTH,
+                       mid - ISLAND_TOGGLE_HEIGHT / 2.0 },
+                     { ISLAND_TOGGLE_WIDTH, ISLAND_TOGGLE_HEIGHT }};
+  *settings = (CGRect){{ toggle->origin.x - ISLAND_CONTROL_GAP
+                                          - ISLAND_SETTINGS_SIZE,
+                         mid - ISLAND_SETTINGS_SIZE / 2.0       },
+                       { ISLAND_SETTINGS_SIZE, ISLAND_SETTINGS_SIZE }};
+}
+
 // ---------------------------------------------------------------- system
 
 static uint32_t island_level_color(int percent, bool high_is_good);
@@ -1004,8 +1060,15 @@ static void island_draw_graph_card(CGContextRef context,
   island_draw_graph(context, values, count, color, graph);
 }
 
+// The info card's Wi-Fi switch and settings button (line 2, right).
+static void island_info_controls(CGRect card, CGRect* toggle, CGRect* settings) {
+  island_controls_rects(CGRectGetMaxX(card) - ISLAND_CARD_INSET,
+                        CGRectGetMaxY(card) - 24, toggle, settings);
+}
+
 static void island_draw_info_card(CGContextRef context,
                                   const struct system_info* info,
+                                  double wifi_toggle,
                                   CGRect card                   ) {
   island_draw_glass(context, card, ISLAND_CARD_RADIUS, 1.0);
 
@@ -1014,29 +1077,34 @@ static void island_draw_info_card(CGContextRef context,
   CGFloat top = CGRectGetMaxY(card);
   CGFloat text_x = x + ISLAND_INFO_ICON + 4;
 
-  // Line 1: OS.
+  // Line 1: OS, chip and memory in what is left on the right.
   CGRect icon = {{ x, top - 17 }, { ISLAND_INFO_ICON, 12 }};
   island_draw_glyph(context, g_glyphs[GLYPH_APPLE], g_fonts.small_icon,
                     ISLAND_COLOR_WHITE, 0.8, icon                      );
-  island_draw_text(context, info->os, g_fonts.body, 0.9,
-                   text_x, top - 14, right - text_x, ALIGN_LEFT);
+  CGFloat os = island_draw_text(context, info->os, g_fonts.body, 0.9,
+                                text_x, top - 14, right - text_x,
+                                ALIGN_LEFT                        );
+  island_draw_text(context, info->hardware, g_fonts.caption, 0.5,
+                   right, top - 14, right - text_x - os - 8, ALIGN_RIGHT);
 
-  // Line 2: connection (green when online), chip and memory on the right.
+  // Line 2: the connection (the joined Wi-Fi network's name, green when
+  // online), then the Wi-Fi settings button and switch.
+  CGRect toggle, settings;
+  island_info_controls(card, &toggle, &settings);
+
   icon.origin.y = top - 30;
   bool wired = info->network == SYSTEM_NETWORK_ETHERNET;
+  bool connected = info->online && (wired || info->wifi_ssid[0]);
   island_draw_glyph(context, g_glyphs[wired ? GLYPH_ETHERNET : GLYPH_WIFI],
                     g_fonts.small_icon,
-                    info->online ? ISLAND_COLOR_GREEN : ISLAND_COLOR_RED,
-                    1.0, icon                                          );
-  CGFloat hardware = island_draw_text(context, info->hardware,
-                                      g_fonts.caption, 0.5,
-                                      right, top - 27,
-                                      (right - text_x) * 0.6,
-                                      ALIGN_RIGHT            );
+                    connected ? ISLAND_COLOR_GREEN : ISLAND_COLOR_WHITE,
+                    connected ? 1.0 : 0.4, icon                        );
   island_draw_text(context, info->network_name, g_fonts.caption,
-                   info->online ? 0.75 : 0.5,
-                   text_x, top - 27, right - text_x - hardware - 6,
-                   ALIGN_LEFT                                     );
+                   connected ? 0.8 : 0.5,
+                   text_x, top - 27, settings.origin.x - 6 - text_x,
+                   ALIGN_LEFT                                       );
+  island_draw_settings_button(context, settings);
+  if (info->wifi_available) island_draw_toggle(context, toggle, wifi_toggle);
 }
 
 // System tab, top to bottom: info card, brightness row (like the Music
@@ -1090,7 +1158,11 @@ static void island_draw_system(CGContextRef context,
   const struct system_stats_history* history = g_data->history;
   struct island_system_layout system = island_get_system_layout(layout);
 
-  island_draw_info_card(context, g_data->info, system.info);
+  island_draw_info_card(context, g_data->info,
+                        g_drawing
+                        ? g_drawing->toggle_progress[ISLAND_TOGGLE_WIFI]
+                        : 0,
+                        system.info                                     );
 
   // Brightness
   bool has = g_data->has_brightness;
@@ -1119,313 +1191,126 @@ static void island_draw_system(CGContextRef context,
                          ISLAND_COLOR_MAGENTA, ram          );
 }
 
-// ---------------------------------------------------------------- connections
+// ---------------------------------------------------------------- bluetooth
 
-// Two columns (Wi-Fi left, Bluetooth right) of a header with an on/off switch
-// and a scrollable list. The Wi-Fi password prompt takes the Bluetooth
-// column's place while the bar widens the island.
-enum { COLUMN_WIFI, COLUMN_BLUETOOTH };
-
-struct island_connections_layout {
+// A header (icon, title, settings button, on/off switch) and the paired
+// devices below it. Connect results show as a banner at the bottom.
+struct island_bluetooth_layout {
   CGRect page;
-  CGRect header[2];
-  CGRect toggle[2];
-  CGRect list[2];
+  CGRect header;
+  CGRect toggle;
+  CGRect settings;
+  CGRect list;
   CGRect notice;
-  CGRect prompt;
-  CGRect prompt_field;
-  CGRect prompt_cancel;
-  CGRect prompt_join;
-  CGRect prompt_back;
 };
 
-static struct island_connections_layout island_get_connections_layout(
+static struct island_bluetooth_layout island_get_bluetooth_layout(
                                               struct island_layout* layout) {
-  struct island_connections_layout c;
-  c.page = island_page_rect(layout);
-  CGFloat top = CGRectGetMaxY(c.page);
+  struct island_bluetooth_layout b;
+  b.page = island_page_rect(layout);
+  CGFloat top = CGRectGetMaxY(b.page);
 
-  CGFloat x[2] = { c.page.origin.x,
-                   c.page.origin.x + ISLAND_COLUMN_WIDTH + ISLAND_COLUMN_GAP };
-  CGFloat width[2] = { ISLAND_COLUMN_WIDTH,
-                       CGRectGetMaxX(c.page) - x[1]       };
-
-  for (int i = 0; i < 2; i++) {
-    c.header[i] = (CGRect){{ x[i], top - ISLAND_COLUMN_HEADER },
-                           { width[i], ISLAND_COLUMN_HEADER }};
-    c.toggle[i] = (CGRect){{ CGRectGetMaxX(c.header[i]) - ISLAND_TOGGLE_WIDTH,
-                             CGRectGetMidY(c.header[i])
-                             - ISLAND_TOGGLE_HEIGHT / 2.0                    },
-                           { ISLAND_TOGGLE_WIDTH, ISLAND_TOGGLE_HEIGHT }};
-    c.list[i] = (CGRect){{ x[i], c.page.origin.y },
-                         { width[i], c.header[i].origin.y - 4
-                                     - c.page.origin.y        }};
-  }
-
-  c.notice = (CGRect){{ c.page.origin.x, c.page.origin.y },
-                      { c.page.size.width, ISLAND_NOTICE_BAR }};
-
-  // Prompt, top to bottom: back button + "Join network", the name, the
-  // field, buttons.
-  c.prompt = (CGRect){{ x[1], c.page.origin.y },
-                      { width[1], c.page.size.height }};
-  c.prompt_back = (CGRect){{ x[1] - 2, top - 15 }, { 16, 16 }};
-  c.prompt_field = (CGRect){{ x[1], top - 38 - ISLAND_FIELD_HEIGHT },
-                            { width[1], ISLAND_FIELD_HEIGHT }};
-  CGFloat buttons = c.prompt_field.origin.y - 8 - ISLAND_BUTTON_HEIGHT;
-  CGFloat button_width = (width[1] - 6) / 2.0;
-  c.prompt_cancel = (CGRect){{ x[1], buttons },
-                             { button_width, ISLAND_BUTTON_HEIGHT }};
-  c.prompt_join = (CGRect){{ CGRectGetMaxX(c.prompt_cancel) + 6, buttons },
-                           { button_width, ISLAND_BUTTON_HEIGHT }};
-  return c;
+  b.header = (CGRect){{ b.page.origin.x, top - ISLAND_COLUMN_HEADER },
+                      { b.page.size.width, ISLAND_COLUMN_HEADER }};
+  island_controls_rects(CGRectGetMaxX(b.header), CGRectGetMidY(b.header),
+                        &b.toggle, &b.settings                          );
+  b.list = (CGRect){{ b.page.origin.x, b.page.origin.y },
+                    { b.page.size.width,
+                      b.header.origin.y - 4 - b.page.origin.y }};
+  b.notice = (CGRect){{ b.page.origin.x, b.page.origin.y },
+                      { b.page.size.width, ISLAND_NOTICE_BAR }};
+  return b;
 }
 
-static int island_column_rows(const struct connections* connections,
-                              int column                            ) {
-  if (column == COLUMN_WIFI) {
-    if (!connections->wifi_on) return 0;
-    return connections->wifi_count;
-  }
+static int island_bluetooth_rows(const struct connections* connections) {
   return connections->bluetooth_on ? connections->bluetooth_count : 0;
 }
 
-static CGFloat island_column_max_scroll(const struct connections* connections,
-                                        struct island_connections_layout* c,
-                                        int column                          ) {
-  CGFloat height = island_column_rows(connections, column) * ISLAND_ROW_HEIGHT;
-  return max(height - c->list[column].size.height, 0);
+static CGFloat island_bluetooth_max_scroll(const struct connections* conn,
+                                           struct island_bluetooth_layout* b) {
+  return max(island_bluetooth_rows(conn) * ISLAND_ROW_HEIGHT
+             - b->list.size.height, 0);
 }
 
-// Rect of row `row` (0 = first) of a column's list, scrolled.
-static CGRect island_column_row(struct island* island,
-                                struct island_connections_layout* c,
-                                int column,
-                                int row                            ) {
-  CGRect list = c->list[column];
-  CGFloat top = CGRectGetMaxY(list) - row * ISLAND_ROW_HEIGHT
-                + island->column_scroll[column];
-  return (CGRect){{ list.origin.x, top - ISLAND_ROW_HEIGHT },
-                  { list.size.width, ISLAND_ROW_HEIGHT }};
+static CGRect island_bluetooth_row(struct island_bluetooth_layout* b,
+                                   int row,
+                                   CGFloat scroll_offset            ) {
+  CGFloat top = CGRectGetMaxY(b->list) - row * ISLAND_ROW_HEIGHT
+                + scroll_offset;
+  return (CGRect){{ b->list.origin.x, top - ISLAND_ROW_HEIGHT },
+                  { b->list.size.width, ISLAND_ROW_HEIGHT }};
 }
 
-// An on/off switch at `progress` (0 off, 1 on; in between while it moves):
-// the track fades from grey to green and the knob slides over, stretching a
-// little on the way like a drop of liquid.
-static void island_draw_toggle(CGContextRef context,
-                               CGRect rect,
-                               double progress     ) {
-  CGFloat t = max(min(progress, 1.0), 0.0);
-  CGFloat radius = rect.size.height / 2.0;
-
-  island_add_rounded_rect(context, rect, radius);
-  island_set_fill(context, ISLAND_COLOR_WHITE, 0.2);
-  CGContextFillPath(context);
-  if (t > 0) {
-    island_add_rounded_rect(context, rect, radius);
-    island_set_fill(context, ISLAND_COLOR_GREEN, t);
-    CGContextFillPath(context);
-  }
-
-  CGFloat knob = rect.size.height - 2;
-  CGFloat stretch = ISLAND_TOGGLE_STRETCH * sin(M_PI * t);
-  CGFloat travel = rect.size.width - knob - 2;
-  CGRect pill = {{ rect.origin.x + 1 + travel * t - stretch * t,
-                   rect.origin.y + 1                          },
-                 { knob + stretch, knob }};
-  island_add_rounded_rect(context, pill, knob / 2.0);
-  island_set_fill(context, ISLAND_COLOR_WHITE, 0.95);
-  CGContextFillPath(context);
+// Battery icon for a level: full above 80%, then 3/4, 1/2, 1/4 and empty
+// (10% and below).
+static const char* island_battery_glyph(int percent) {
+  if (percent > 80) return g_glyphs[GLYPH_BATTERY_4];
+  if (percent > 60) return g_glyphs[GLYPH_BATTERY_3];
+  if (percent > 35) return g_glyphs[GLYPH_BATTERY_2];
+  if (percent > 10) return g_glyphs[GLYPH_BATTERY_1];
+  return g_glyphs[GLYPH_BATTERY_0];
 }
 
-static void island_draw_column_header(CGContextRef context,
-                                      struct island_connections_layout* c,
-                                      int column,
-                                      const char* glyph,
-                                      const char* title,
-                                      bool on,
-                                      double toggle                      ) {
-  CGRect header = c->header[column];
-  CGRect icon = {{ header.origin.x, header.origin.y }, { 14, header.size.height }};
-  island_draw_glyph(context, glyph, g_fonts.small_icon, ISLAND_COLOR_WHITE,
-                    on ? 0.9 : 0.4, icon                                  );
-  island_draw_text(context, title, g_fonts.title, on ? 0.95 : 0.5,
-                   header.origin.x + 18, CGRectGetMidY(header) - 4,
-                   c->toggle[column].origin.x - header.origin.x - 22,
-                   ALIGN_LEFT                                       );
-  island_draw_toggle(context, c->toggle[column], toggle);
+// The battery of a device right-aligned at `right` in `row`: icon in the
+// level's color and the percentage. Returns the width it took.
+static CGFloat island_draw_device_battery(CGContextRef context,
+                                          CGRect row,
+                                          CGFloat right,
+                                          int percent      ) {
+  char text[8];
+  snprintf(text, sizeof(text), "%d%%", percent);
+  CGFloat width = island_draw_text(context, text, g_fonts.caption, 0.75,
+                                   right, CGRectGetMidY(row) - 3,
+                                   row.size.width, ALIGN_RIGHT       );
+
+  CGRect icon = {{ right - width - 4 - ISLAND_BATTERY_ICON, row.origin.y },
+                 { ISLAND_BATTERY_ICON, row.size.height }};
+  island_draw_glyph(context, island_battery_glyph(percent), g_fonts.small_icon,
+                    island_level_color(percent, true), 1.0, icon             );
+  return width + 4 + ISLAND_BATTERY_ICON;
 }
 
-static void island_draw_column_message(CGContextRef context,
-                                       CGRect list,
-                                       const char* text      ) {
+static void island_draw_bluetooth_message(CGContextRef context,
+                                          CGRect list,
+                                          const char* text      ) {
   island_draw_text(context, text, g_fonts.caption, 0.4,
                    CGRectGetMidX(list), CGRectGetMaxY(list) - 24,
                    list.size.width, ALIGN_CENTER                 );
 }
 
-// Three bars, the lit ones by signal strength.
-static void island_draw_signal(CGContextRef context, CGRect rect, int bars) {
-  for (int i = 0; i < 3; i++) {
-    CGFloat height = 3 + i * 2;
-    CGRect bar = {{ rect.origin.x + i * 3, CGRectGetMidY(rect) - 4 },
-                  { 2, height }};
-    island_set_fill(context, ISLAND_COLOR_WHITE, i < bars ? 0.8 : 0.2);
-    CGContextFillRect(context, bar);
-  }
-}
-
-static void island_draw_wifi_list(struct island* island,
-                                  CGContextRef context,
-                                  struct island_connections_layout* c,
-                                  const struct connections* connections) {
-  CGRect list = c->list[COLUMN_WIFI];
-  if (!connections->wifi_available) {
-    island_draw_column_message(context, list, "No Wi-Fi");
-    return;
-  }
-  if (!connections->wifi_on) {
-    island_draw_column_message(context, list, "Off");
-    return;
-  }
-  if (connections->wifi_count == 0) {
-    island_draw_column_message(context, list,
-                               connections->wifi_scanning
-                               && !connections->wifi_names_hidden
-                               ? "Scanning…"
-                               : "No networks"                    );
-    return;
-  }
-
-  CGContextSaveGState(context);
-  CGContextClipToRect(context, list);
-  for (int i = 0; i < connections->wifi_count; i++) {
-    CGRect row = island_column_row(island, c, COLUMN_WIFI, i);
-    if (!CGRectIntersectsRect(row, list)) continue;
-    const struct wifi_network* network = &connections->wifi[i];
-
-    // Right side: a tick for the current network, else lock and signal.
-    CGFloat right = CGRectGetMaxX(row);
-    CGFloat reserved = 0;
-    if (network->current) {
-      CGRect tick = {{ right - 10, row.origin.y }, { 10, row.size.height }};
-      island_draw_glyph(context, g_glyphs[GLYPH_CHECK], g_fonts.small_icon,
-                        ISLAND_COLOR_GREEN, 1.0, tick                      );
-      reserved = 14;
-    } else {
-      if (network->signal >= 0) {
-        island_draw_signal(context,
-                           CGRectMake(right - 8, row.origin.y, 8,
-                                      row.size.height            ),
-                           network->signal                         );
-        reserved = 12;
-      }
-      if (network->secure && !network->known) {
-        CGRect lock = {{ right - reserved - 9, row.origin.y },
-                       { 9, row.size.height }};
-        island_draw_glyph(context, g_glyphs[GLYPH_LOCK], g_fonts.caption,
-                          ISLAND_COLOR_WHITE, 0.45, lock                  );
-        reserved += 12;
-      }
-    }
-
-    island_draw_text_colored(context, network->ssid, g_fonts.body,
-                             network->current ? ISLAND_COLOR_GREEN
-                                              : ISLAND_COLOR_WHITE,
-                             network->current || network->known ? 0.95 : 0.7,
-                             row.origin.x, CGRectGetMidY(row) - 3,
-                             row.size.width - reserved, ALIGN_LEFT          );
-  }
-  CGContextRestoreGState(context);
-}
-
-static void island_draw_bluetooth_list(struct island* island,
-                                       CGContextRef context,
-                                       struct island_connections_layout* c,
-                                       const struct connections* connections) {
-  CGRect list = c->list[COLUMN_BLUETOOTH];
-  if (!connections->bluetooth_available) {
-    island_draw_column_message(context, list, "No Bluetooth");
-    return;
-  }
-  if (!connections->bluetooth_on) {
-    island_draw_column_message(context, list, "Off");
-    return;
-  }
-  if (connections->bluetooth_count == 0) {
-    island_draw_column_message(context, list, "No paired devices");
-    return;
-  }
-
-  CGContextSaveGState(context);
-  CGContextClipToRect(context, list);
-  for (int i = 0; i < connections->bluetooth_count; i++) {
-    CGRect row = island_column_row(island, c, COLUMN_BLUETOOTH, i);
-    if (!CGRectIntersectsRect(row, list)) continue;
-    const struct bluetooth_device* device = &connections->bluetooth[i];
-
-    CGFloat reserved = 0;
-    if (device->connected) {
-      CGRect tick = {{ CGRectGetMaxX(row) - 10, row.origin.y },
-                     { 10, row.size.height }};
-      island_draw_glyph(context, g_glyphs[GLYPH_CHECK], g_fonts.small_icon,
-                        ISLAND_COLOR_GREEN, 1.0, tick                      );
-      reserved = 14;
-    }
-    island_draw_text_colored(context, device->name, g_fonts.body,
-                             device->connected ? ISLAND_COLOR_GREEN
-                                               : ISLAND_COLOR_WHITE,
-                             device->connected ? 0.95 : 0.75,
-                             row.origin.x, CGRectGetMidY(row) - 3,
-                             row.size.width - reserved, ALIGN_LEFT);
-  }
-  CGContextRestoreGState(context);
-}
-
-// Glyph, color and text of a connect attempt's state.
-static void island_status_line(const struct connections* connections,
-                               const char** glyph,
-                               uint32_t* color,
-                               char* text,
-                               size_t size                          ) {
-  const char* target = connections->status_target;
-  bool off = connections->status_disconnect;
-  switch (connections->status) {
-    case CONNECTION_SUCCEEDED:
-      *glyph = g_glyphs[GLYPH_CHECK];
-      *color = ISLAND_COLOR_GREEN;
-      snprintf(text, size, off ? "Disconnected %s" : "Connected to %s",
-               target                                                  );
-      break;
-    case CONNECTION_FAILED:
-      *glyph = g_glyphs[GLYPH_CROSS];
-      *color = ISLAND_COLOR_RED;
-      snprintf(text, size, off ? "Couldn't disconnect %s"
-                               : "Couldn't connect to %s", target);
-      break;
-    default:
-      *glyph = NULL;
-      *color = ISLAND_COLOR_WHITE;
-      snprintf(text, size, off ? "Disconnecting %s…" : "Connecting to %s…",
-               target                                                    );
-      break;
-  }
-}
-
-// Bottom banner for attempts that don't go through the prompt.
+// Bottom banner with the last connect attempt.
 static void island_draw_notice(CGContextRef context,
-                               struct island_connections_layout* c,
+                               struct island_bluetooth_layout* b,
                                const struct connections* connections) {
-  CGRect notice = c->notice;
+  CGRect notice = b->notice;
   island_add_rounded_rect(context, notice, notice.size.height / 2.0);
   island_set_fill(context, 0xff000000, 0.85);
   CGContextFillPath(context);
   island_draw_glass(context, notice, notice.size.height / 2.0, 1.4);
 
-  const char* glyph;
-  uint32_t color;
+  const char* target = connections->status_target;
+  bool off = connections->status_disconnect;
+  const char* glyph = NULL;
+  uint32_t color = ISLAND_COLOR_WHITE;
   char text[CONNECTIONS_NAME + 32];
-  island_status_line(connections, &glyph, &color, text, sizeof(text));
+  switch (connections->status) {
+    case CONNECTION_SUCCEEDED:
+      glyph = g_glyphs[GLYPH_CHECK];
+      color = ISLAND_COLOR_GREEN;
+      snprintf(text, sizeof(text), off ? "Disconnected %s" : "Connected to %s",
+               target                                                     );
+      break;
+    case CONNECTION_FAILED:
+      glyph = g_glyphs[GLYPH_CROSS];
+      color = ISLAND_COLOR_RED;
+      snprintf(text, sizeof(text), off ? "Couldn't disconnect %s"
+                                       : "Couldn't connect to %s", target);
+      break;
+    default:
+      snprintf(text, sizeof(text), off ? "Disconnecting %s…"
+                                       : "Connecting to %s…", target);
+      break;
+  }
 
   CGFloat x = notice.origin.x + 10;
   if (glyph) {
@@ -1439,189 +1324,98 @@ static void island_draw_notice(CGContextRef context,
                            CGRectGetMaxX(notice) - 10 - x, ALIGN_LEFT);
 }
 
-static void island_draw_button(CGContextRef context,
-                               CGRect rect,
-                               const char* title,
-                               bool primary      ) {
-  if (primary) {
-    island_add_rounded_rect(context, rect, rect.size.height / 2.0);
-    island_set_fill(context, ISLAND_COLOR_BLUE, 0.9);
-    CGContextFillPath(context);
-  } else {
-    island_draw_glass(context, rect, rect.size.height / 2.0, 1.2);
-  }
-  island_draw_text_colored(context, title, g_fonts.caption,
-                           primary ? 0xff000000 : ISLAND_COLOR_WHITE,
-                           0.9, CGRectGetMidX(rect),
-                           CGRectGetMidY(rect) - 3,
-                           rect.size.width, ALIGN_CENTER             );
-}
-
-static void island_draw_prompt(struct island* island,
-                               CGContextRef context,
-                               struct island_connections_layout* c,
-                               const struct connections* connections) {
-  CGRect prompt = c->prompt;
-  CGFloat top = CGRectGetMaxY(prompt);
-
-  // Back (same as Cancel), for a network picked by mistake.
-  if (!island->prompt_joining) {
-    island_draw_glyph(context, g_glyphs[GLYPH_BACK], g_fonts.small_icon,
-                      ISLAND_COLOR_WHITE, 0.75, c->prompt_back           );
-  }
-  CGFloat title_x = island->prompt_joining ? prompt.origin.x
-                                           : CGRectGetMaxX(c->prompt_back) + 2;
-  island_draw_text(context, "Join network", g_fonts.caption, 0.5,
-                   title_x, top - 11, CGRectGetMaxX(prompt) - title_x,
-                   ALIGN_LEFT                                         );
-  island_draw_text(context, island->prompt_ssid, g_fonts.title, 0.95,
-                   prompt.origin.x, top - 27, prompt.size.width, ALIGN_LEFT);
-
-  // The real (secure) text field is laid over this while typing.
-  island_draw_glass(context, c->prompt_field, 7, 1.2);
-  if (island->prompt_joining) {
-    island_draw_text(context, "••••••••", g_fonts.body, 0.6,
-                     c->prompt_field.origin.x + 8,
-                     CGRectGetMidY(c->prompt_field) - 3,
-                     c->prompt_field.size.width - 16, ALIGN_LEFT);
-  }
-
-  if (!island->prompt_joining) {
-    island_draw_button(context, c->prompt_cancel, "Cancel", false);
-    island_draw_button(context, c->prompt_join, "Join", true);
-    return;
-  }
-
-  // Joining: the attempt's state instead of the buttons.
-  const char* glyph;
-  uint32_t color;
-  char text[CONNECTIONS_NAME + 32];
-  if (connections->status == CONNECTION_SUCCEEDED) {
-    glyph = g_glyphs[GLYPH_CHECK];
-    color = ISLAND_COLOR_GREEN;
-    snprintf(text, sizeof(text), "Connected");
-  } else if (connections->status == CONNECTION_FAILED) {
-    glyph = g_glyphs[GLYPH_CROSS];
-    color = ISLAND_COLOR_RED;
-    snprintf(text, sizeof(text), "Couldn't connect");
-  } else {
-    glyph = NULL;
-    color = ISLAND_COLOR_WHITE;
-    snprintf(text, sizeof(text), "Connecting…");
-  }
-
-  CGRect line = { c->prompt_cancel.origin,
-                  { prompt.size.width, ISLAND_BUTTON_HEIGHT } };
-  CGFloat x = line.origin.x;
-  if (glyph) {
-    island_draw_glyph(context, glyph, g_fonts.small_icon, color, 1.0,
-                      CGRectMake(x, line.origin.y, 12, line.size.height));
-    x += 17;
-  }
-  island_draw_text_colored(context, text, g_fonts.body, color, 0.95,
-                           x, CGRectGetMidY(line) - 3,
-                           CGRectGetMaxX(line) - x, ALIGN_LEFT);
-}
-
-static void island_draw_connections(CGContextRef context,
-                                    struct island_layout* layout) {
+static void island_draw_bluetooth(CGContextRef context,
+                                  struct island_layout* layout,
+                                  CGFloat scroll_offset       ) {
   if (!g_data || !g_data->connections || !g_drawing) return;
   struct island* island = g_drawing;
   const struct connections* connections = g_data->connections;
-  struct island_connections_layout c = island_get_connections_layout(layout);
-  double prompt = island->prompt ? island->prompt_progress : 0;
+  struct island_bluetooth_layout b = island_get_bluetooth_layout(layout);
+  bool on = connections->bluetooth_on;
 
-  island_draw_column_header(context, &c, COLUMN_WIFI, g_glyphs[GLYPH_WIFI],
-                            "Wi-Fi", connections->wifi_on,
-                            island->toggle_progress[COLUMN_WIFI]          );
-  island_draw_wifi_list(island, context, &c, connections);
+  // Header
+  CGRect icon = {{ b.header.origin.x, b.header.origin.y },
+                 { 14, b.header.size.height }};
+  island_draw_glyph(context, g_glyphs[GLYPH_BLUETOOTH], g_fonts.small_icon,
+                    ISLAND_COLOR_WHITE, on ? 0.9 : 0.4, icon               );
+  island_draw_text(context, "Bluetooth", g_fonts.title, on ? 0.95 : 0.5,
+                   b.header.origin.x + 18, CGRectGetMidY(b.header) - 4,
+                   b.settings.origin.x - b.header.origin.x - 22,
+                   ALIGN_LEFT                                     );
+  island_draw_settings_button(context, b.settings);
+  island_draw_toggle(context, b.toggle,
+                     island->toggle_progress[ISLAND_TOGGLE_BLUETOOTH]);
 
-  // The Bluetooth column fades away during the first half of the widening,
-  // the prompt fades in during the second, so they never overlap.
-  double bluetooth_alpha = max(1.0 - 2.0 * prompt, 0.0);
-  double prompt_alpha = max(2.0 * prompt - 1.0, 0.0);
-
-  if (bluetooth_alpha > 0) {
+  // Devices
+  if (!connections->bluetooth_available) {
+    island_draw_bluetooth_message(context, b.list, "No Bluetooth");
+  } else if (!on) {
+    island_draw_bluetooth_message(context, b.list, "Off");
+  } else if (connections->bluetooth_count == 0) {
+    island_draw_bluetooth_message(context, b.list, "No paired devices");
+  } else {
     CGContextSaveGState(context);
-    CGContextSetAlpha(context, bluetooth_alpha);
-    CGContextBeginTransparencyLayer(context, NULL);
-    island_draw_column_header(context, &c, COLUMN_BLUETOOTH,
-                              g_glyphs[GLYPH_BLUETOOTH], "Bluetooth",
-                              connections->bluetooth_on,
-                              island->toggle_progress[COLUMN_BLUETOOTH]);
-    island_draw_bluetooth_list(island, context, &c, connections);
-    CGContextEndTransparencyLayer(context);
+    CGContextClipToRect(context, b.list);
+    for (int i = 0; i < connections->bluetooth_count; i++) {
+      CGRect row = island_bluetooth_row(&b, i, scroll_offset);
+      if (!CGRectIntersectsRect(row, b.list)) continue;
+      const struct bluetooth_device* device = &connections->bluetooth[i];
+
+      // Right to left: the tick for a connected device, then its battery.
+      CGFloat reserved = 0;
+      if (device->connected) {
+        CGRect tick = {{ CGRectGetMaxX(row) - 10, row.origin.y },
+                       { 10, row.size.height }};
+        island_draw_glyph(context, g_glyphs[GLYPH_CHECK], g_fonts.small_icon,
+                          ISLAND_COLOR_GREEN, 1.0, tick                      );
+        reserved = 14;
+      }
+      if (device->battery >= 0) {
+        reserved += island_draw_device_battery(context, row,
+                                               CGRectGetMaxX(row) - reserved,
+                                               device->battery              )
+                    + 8;
+      }
+      island_draw_text_colored(context, device->name, g_fonts.body,
+                               device->connected ? ISLAND_COLOR_GREEN
+                                                 : ISLAND_COLOR_WHITE,
+                               device->connected ? 0.95 : 0.75,
+                               row.origin.x, CGRectGetMidY(row) - 3,
+                               row.size.width - reserved, ALIGN_LEFT);
+    }
     CGContextRestoreGState(context);
   }
 
-  if (prompt_alpha > 0) {
-    CGContextSaveGState(context);
-    CGContextSetAlpha(context, prompt_alpha);
-    CGContextBeginTransparencyLayer(context, NULL);
-    island_draw_prompt(island, context, &c, connections);
-    CGContextEndTransparencyLayer(context);
-    CGContextRestoreGState(context);
-  } else if (prompt == 0 && connections->status != CONNECTION_IDLE) {
-    island_draw_notice(context, &c, connections);
-  }
+  if (connections->status != CONNECTION_IDLE)
+    island_draw_notice(context, &b, connections);
 }
 
-CGRect island_prompt_field_rect(struct island* island, CGRect panel) {
-  struct island_layout layout = island_get_layout(panel);
-  struct island_connections_layout c = island_get_connections_layout(&layout);
-  // Text inset inside the drawn glass field.
-  return CGRectInset(c.prompt_field, 8, 2);
-}
+static bool island_handle_bluetooth_click(struct island* island,
+                                          struct island_layout* layout,
+                                          CGPoint point,
+                                          struct island_action* action) {
+  struct island_bluetooth_layout b = island_get_bluetooth_layout(layout);
+  if (!CGRectContainsPoint(b.page, point)) return false;
 
-static bool island_handle_connections_click(struct island* island,
-                                            struct island_layout* layout,
-                                            CGPoint point,
-                                            struct island_action* action) {
-  struct island_connections_layout c = island_get_connections_layout(layout);
-  if (!CGRectContainsPoint(c.page, point)) return false;
-
-  if (island->prompt) {
-    if (island->prompt_joining) return true;
-
-    if (CGRectContainsPoint(c.prompt_join, point)) {
-      action->type = ISLAND_ACTION_PROMPT_JOIN;
-      return true;
-    }
-    if (CGRectContainsPoint(c.prompt_cancel, point)
-        || CGRectContainsPoint(CGRectInset(c.prompt_back, -4, -4), point)) {
-      action->type = ISLAND_ACTION_PROMPT_CANCEL;
-      return true;
-    }
-    // Another network in the list switches the prompt to it (below).
-    if (!CGRectContainsPoint(c.list[COLUMN_WIFI], point)) return true;
-  }
-
-  if (CGRectContainsPoint(CGRectInset(c.toggle[COLUMN_WIFI], -4, -4), point)) {
-    action->type = ISLAND_ACTION_WIFI_POWER;
+  if (CGRectContainsPoint(CGRectInset(b.toggle, -4, -4), point)) {
+    action->type = ISLAND_ACTION_BLUETOOTH_POWER;
     return true;
   }
-  if (CGRectContainsPoint(CGRectInset(c.toggle[COLUMN_BLUETOOTH], -4, -4),
-                          point                                         )) {
-    action->type = ISLAND_ACTION_BLUETOOTH_POWER;
+  if (CGRectContainsPoint(CGRectInset(b.settings, -3, -3), point)) {
+    action->type = ISLAND_ACTION_BLUETOOTH_SETTINGS;
     return true;
   }
 
   const struct connections* connections = connections_get();
-  for (int column = 0; column < 2; column++) {
-    if (!CGRectContainsPoint(c.list[column], point)) continue;
-    if (island->prompt && column != COLUMN_WIFI) continue;
-
-    int rows = island_column_rows(connections, column);
-    for (int row = 0; row < rows; row++) {
-      if (!CGRectContainsPoint(island_column_row(island, &c, column, row),
-                               point                                     )) {
-        continue;
-      }
-      action->type = column == COLUMN_WIFI ? ISLAND_ACTION_WIFI_SELECT
-                                           : ISLAND_ACTION_BLUETOOTH_SELECT;
-      action->index = row;
-      break;
-    }
+  if (!CGRectContainsPoint(b.list, point)) return true;
+  for (int row = 0; row < island_bluetooth_rows(connections); row++) {
+    if (!CGRectContainsPoint(island_bluetooth_row(&b, row,
+                                                  island->scroll_offset),
+                             point                                    ))
+      continue;
+    action->type = ISLAND_ACTION_BLUETOOTH_SELECT;
+    action->index = row;
+    break;
   }
   return true;
 }
@@ -1756,8 +1550,8 @@ static void island_draw_page(CGContextRef context,
     case ISLAND_SERVICE_SYSTEM:
       island_draw_system(context, layout);
       break;
-    case ISLAND_SERVICE_CONNECTIONS:
-      island_draw_connections(context, layout);
+    case ISLAND_SERVICE_BLUETOOTH:
+      island_draw_bluetooth(context, layout, scroll_offset);
       break;
     case ISLAND_SERVICE_SCREENS:
       island_draw_screens(context, layout);
@@ -2065,8 +1859,8 @@ bool island_handle_click(struct island* island,
     return true;
   }
 
-  if (island->service == ISLAND_SERVICE_CONNECTIONS
-      && island_handle_connections_click(island, &layout, point, action)) {
+  if (island->service == ISLAND_SERVICE_BLUETOOTH
+      && island_handle_bluetooth_click(island, &layout, point, action)) {
     return true;
   }
 
@@ -2079,9 +1873,16 @@ bool island_handle_click(struct island* island,
   if (island->service == ISLAND_SERVICE_SYSTEM
       && CGRectContainsPoint(island_page_rect(&layout), point)) {
     struct island_system_layout system = island_get_system_layout(&layout);
+    CGRect toggle, settings;
+    island_info_controls(system.info, &toggle, &settings);
+
     if (CGRectContainsPoint(system.slider_hit, point)) {
       action->type = ISLAND_ACTION_SET_BRIGHTNESS;
       action->value = island_slider_fraction(system.slider, point);
+    } else if (CGRectContainsPoint(CGRectInset(toggle, -4, -4), point)) {
+      action->type = ISLAND_ACTION_WIFI_POWER;
+    } else if (CGRectContainsPoint(CGRectInset(settings, -3, -3), point)) {
+      action->type = ISLAND_ACTION_WIFI_SETTINGS;
     }
     return true;
   }
@@ -2107,28 +1908,20 @@ bool island_handle_scroll(struct island* island,
                           CGFloat delta          ) {
   if (!g_loaded || !CGRectContainsPoint(panel, point)) return false;
 
-  // Connections: the list under the pointer scrolls (right away).
-  if (island->service == ISLAND_SERVICE_CONNECTIONS) {
-    struct island_layout layout = island_get_layout(panel);
-    struct island_connections_layout c = island_get_connections_layout(&layout);
-    const struct connections* connections = connections_get();
-    for (int column = 0; column < 2; column++) {
-      if (point.x < c.list[column].origin.x
-          || point.x > CGRectGetMaxX(c.list[column])) {
-        continue;
-      }
-      CGFloat offset = island->column_scroll[column] - delta;
-      island->column_scroll[column]
-        = max(min(offset, island_column_max_scroll(connections, &c, column)),
-              0                                                           );
-    }
+  // The Alerts and Bluetooth lists scroll the same way: this only moves the
+  // target, the bar glides (wheel) or follows (trackpad) towards it.
+  struct island_layout layout = island_get_layout(panel);
+  CGFloat max_scroll;
+  if (island->service == ISLAND_SERVICE_ALERTS) {
+    max_scroll = island_max_scroll(&layout);
+  } else if (island->service == ISLAND_SERVICE_BLUETOOTH) {
+    struct island_bluetooth_layout b = island_get_bluetooth_layout(&layout);
+    max_scroll = island_bluetooth_max_scroll(connections_get(), &b);
+  } else {
     return true;
   }
 
-  if (island->service != ISLAND_SERVICE_ALERTS) return true;
-
-  struct island_layout layout = island_get_layout(panel);
   CGFloat target = island->scroll_target - delta;
-  island->scroll_target = max(min(target, island_max_scroll(&layout)), 0);
+  island->scroll_target = max(min(target, max_scroll), 0);
   return true;
 }

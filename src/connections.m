@@ -1,20 +1,14 @@
 #include "connections.h"
 #import <AppKit/AppKit.h>
-#import <CoreWLAN/CoreWLAN.h>
 #import <IOBluetooth/IOBluetooth.h>
-#import <SystemConfiguration/SystemConfiguration.h>
+#include <IOKit/IOKitLib.h>
 
 // Private IOBluetooth functions (used by blueutil as well).
 extern int IOBluetoothPreferenceGetControllerPowerState(void);
 extern void IOBluetoothPreferenceSetControllerPowerState(int state);
 
-#define NETWORKSETUP "/usr/sbin/networksetup"
-// A Bluetooth connect that hasn't reported back after this long failed.
+// A connect that hasn't reported back after this long failed.
 #define BLUETOOTH_TIMEOUT 15.0
-#define PASSWORD_SLOTS    8
-#define PASSWORD_LENGTH   128
-
-// ------------------------------------------------------------ state
 
 // Main thread only.
 static struct connections g_state;
@@ -23,29 +17,21 @@ static connections_callback* g_callback = NULL;
 static uint64_t g_generation = 0;
 // Bumped per connect attempt: only the latest one may clear the notice.
 static uint64_t g_attempt = 0;
-
-static dispatch_queue_t g_queue = NULL;
 static dispatch_source_t g_refresh_timer = NULL;
-static dispatch_source_t g_scan_timer = NULL;
-static bool g_scan_running = false;
 
-// Last scan (only kept when macOS showed the names) and the saved networks.
-static struct wifi_network g_scanned[CONNECTIONS_MAX_ITEMS];
-static int g_scanned_count = 0;
-static bool g_scan_had_names = false;
-static bool g_scan_done = false;
-static char g_saved[CONNECTIONS_MAX_ITEMS * 4][CONNECTIONS_NAME];
-static int g_saved_count = 0;
+// Battery levels by address (normalized: lowercase hex digits only).
+#define BATTERY_SLOTS CONNECTIONS_MAX_ITEMS
+struct battery_list {
+  int count;
+  struct { char address[16]; int percent; } entries[BATTERY_SLOTS];
+};
+static struct battery_list g_batteries;
+static dispatch_queue_t g_queue = NULL;
+static dispatch_source_t g_battery_timer = NULL;
+static bool g_battery_running = false;
+static int g_connected_count = -1;
 
-// Passwords typed for networks that then failed to join, kept in memory to
-// pre-fill the prompt on the next attempt.
-static struct {
-  char ssid[CONNECTIONS_NAME];
-  char password[PASSWORD_LENGTH];
-} g_passwords[PASSWORD_SLOTS];
-static int g_password_next = 0;
-
-// The Bluetooth connect waiting for its -connectionComplete:status:.
+// The connect waiting for its -connectionComplete:status:.
 static uint64_t g_bluetooth_attempt = 0;
 static char g_bluetooth_address[24];
 
@@ -59,183 +45,156 @@ static void copy_string(char* destination, size_t size, NSString* string) {
   snprintf(destination, size, "%s", string ? [string UTF8String] : "");
 }
 
-static CWInterface* wifi_interface() {
-  return [[CWWiFiClient sharedWiFiClient] interface];
-}
-
-// The network the Mac is on. Without Location access CoreWLAN hides it (nil)
-// and configd's SSID_STR is empty, but configd's cached scan record of the
-// associated network still carries the name.
-static NSString* current_ssid() {
-  CWInterface* wifi = wifi_interface();
-  if (!wifi || !wifi.powerOn) return nil;
-  if (wifi.ssid.length > 0) return wifi.ssid;
-
-  NSString* ssid = nil;
-  SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("sketchybar"),
-                                                 NULL, NULL               );
-  if (!store) return nil;
-
-  NSString* key = [NSString stringWithFormat:
-                     @"State:/Network/Interface/%@/AirPort",
-                     wifi.interfaceName                    ];
-  NSDictionary* state = (NSDictionary*)SCDynamicStoreCopyValue(store,
-                                                      (CFStringRef)key);
-  if ([state isKindOfClass:[NSDictionary class]]) {
-    ssid = state[@"SSID_STR"];
-    NSData* record = state[@"CachedScanRecord"];
-    if (ssid.length == 0 && [record isKindOfClass:[NSData class]]) {
-      NSKeyedUnarchiver* unarchiver
-        = [[NSKeyedUnarchiver alloc] initForReadingFromData:record error:NULL];
-      unarchiver.requiresSecureCoding = NO;
-      id root = [unarchiver decodeObjectForKey:NSKeyedArchiveRootObjectKey];
-      [unarchiver finishDecoding];
-      ssid = [root isKindOfClass:[NSDictionary class]] ? root[@"SSID_STR"]
-                                                       : nil;
-      [unarchiver release];
-    }
-    if (![ssid isKindOfClass:[NSString class]]) ssid = nil;
-    [[ssid retain] autorelease];
+// "B4:EE:25:ED:08:88", "b4-ee-25-ed-08-88" -> "b4ee25ed0888".
+static void normalize_address(const char* address, char* out, size_t size) {
+  size_t length = 0;
+  for (const char* c = address; c && *c && length + 1 < size; c++) {
+    if (isxdigit((unsigned char)*c)) out[length++] = tolower(*c);
   }
-  if (state) CFRelease((CFDictionaryRef)state);
-  CFRelease(store);
-  return ssid.length > 0 ? ssid : nil;
+  out[length] = '\0';
 }
 
-// Runs a tool and returns its trimmed output (stdout + stderr), nil if it
-// couldn't be started.
-static NSString* run_tool(const char* path, NSArray* arguments) {
-  NSTask* task = [[NSTask alloc] init];
-  task.executableURL = [NSURL fileURLWithPath:@(path)];
-  task.arguments = arguments;
-  NSPipe* pipe = [NSPipe pipe];
-  task.standardOutput = pipe;
-  task.standardError = pipe;
-
-  NSString* output = nil;
-  if ([task launchAndReturnError:NULL]) {
-    NSData* data = [[pipe fileHandleForReading] readDataToEndOfFile];
-    [task waitUntilExit];
-    output = [[[[NSString alloc] initWithData:data
-                                     encoding:NSUTF8StringEncoding]
-                                                        autorelease]
-              stringByTrimmingCharactersInSet:
-                [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-  }
-  [task release];
-  return output;
-}
-
-static int signal_bars(NSInteger rssi) {
-  if (rssi >= -60) return 3;
-  if (rssi >= -70) return 2;
-  if (rssi >= -80) return 1;
-  return 0;
-}
-
-// ------------------------------------------------------------ passwords
-
-static int password_slot(const char* ssid) {
-  for (int i = 0; i < PASSWORD_SLOTS; i++) {
-    if (g_passwords[i].ssid[0] && strcmp(g_passwords[i].ssid, ssid) == 0)
-      return i;
+static int battery_for(const char* address) {
+  char key[16];
+  normalize_address(address, key, sizeof(key));
+  for (int i = 0; i < g_batteries.count; i++) {
+    if (strcmp(g_batteries.entries[i].address, key) == 0)
+      return g_batteries.entries[i].percent;
   }
   return -1;
 }
 
-static void remember_failure(const char* ssid, const char* password) {
-  int slot = password_slot(ssid);
-  if (slot < 0) {
-    slot = g_password_next;
-    g_password_next = (g_password_next + 1) % PASSWORD_SLOTS;
+static void battery_list_add(struct battery_list* list,
+                             const char* address,
+                             int percent              ) {
+  if (percent < 0 || percent > 100 || list->count >= BATTERY_SLOTS) return;
+  char key[16];
+  normalize_address(address, key, sizeof(key));
+  if (!key[0]) return;
+  for (int i = 0; i < list->count; i++) {
+    if (strcmp(list->entries[i].address, key) == 0) return;
   }
-  snprintf(g_passwords[slot].ssid, CONNECTIONS_NAME, "%s", ssid);
-  snprintf(g_passwords[slot].password, PASSWORD_LENGTH, "%s",
-           password ? password : "");
+  snprintf(list->entries[list->count].address, 16, "%s", key);
+  list->entries[list->count].percent = percent;
+  list->count++;
 }
 
-static void forget_password(const char* ssid) {
-  int slot = password_slot(ssid);
-  if (slot >= 0) memset(&g_passwords[slot], 0, sizeof(g_passwords[slot]));
-}
-
-const char* connections_wifi_password(const char* ssid) {
-  int slot = password_slot(ssid);
-  return slot >= 0 && g_passwords[slot].password[0]
-         ? g_passwords[slot].password
-         : NULL;
-}
-
-// Saved networks always join directly (macOS has their password); only new
-// secured ones ask.
-bool connections_wifi_needs_password(const struct wifi_network* network) {
-  return network->secure && !network->known;
-}
-
-// ------------------------------------------------------------ wifi list
-
-static bool is_saved(const char* ssid) {
-  for (int i = 0; i < g_saved_count; i++) {
-    if (strcmp(g_saved[i], ssid) == 0) return true;
+// Background queue. HID devices that report a battery level.
+static void read_registry_batteries(struct battery_list* list) {
+  io_iterator_t iterator = IO_OBJECT_NULL;
+  // MACH_PORT_NULL: the default main port (kIOMainPortDefault is 12.0+).
+  if (IOServiceGetMatchingServices(MACH_PORT_NULL,
+        IOServiceMatching("AppleDeviceManagementHIDEventService"),
+        &iterator) != KERN_SUCCESS) {
+    return;
   }
-  return false;
-}
 
-static int compare_networks(const void* a, const void* b) {
-  const struct wifi_network* x = a;
-  const struct wifi_network* y = b;
-  if (x->current != y->current) return x->current ? -1 : 1;
-  if (x->known != y->known) return x->known ? -1 : 1;
-  if (x->signal != y->signal) return y->signal - x->signal;
-  return strcasecmp(x->ssid, y->ssid);
-}
-
-// Main thread. Nearby networks if macOS shows their names, otherwise the
-// saved ones.
-static void rebuild_wifi_list(NSString* current) {
-  const char* current_name = current ? [current UTF8String] : "";
-  g_state.wifi_names_hidden = g_scan_done && !g_scan_had_names;
-  g_state.wifi_count = 0;
-
-  if (g_scan_had_names) {
-    for (int i = 0; i < g_scanned_count; i++) {
-      struct wifi_network network = g_scanned[i];
-      network.known = is_saved(network.ssid);
-      network.current = strcmp(network.ssid, current_name) == 0;
-      g_state.wifi[g_state.wifi_count++] = network;
+  io_object_t service;
+  while ((service = IOIteratorNext(iterator))) {
+    CFTypeRef percent = IORegistryEntryCreateCFProperty(service,
+                          CFSTR("BatteryPercent"), NULL, 0);
+    CFTypeRef address = IORegistryEntryCreateCFProperty(service,
+                          CFSTR("DeviceAddress"), NULL, 0);
+    if (percent && address
+        && CFGetTypeID(percent) == CFNumberGetTypeID()
+        && CFGetTypeID(address) == CFStringGetTypeID()) {
+      int value = -1;
+      char text[32];
+      CFNumberGetValue(percent, kCFNumberIntType, &value);
+      if (CFStringGetCString(address, text, sizeof(text),
+                             kCFStringEncodingUTF8      )) {
+        battery_list_add(list, text, value);
+      }
     }
-  } else if (current_name[0]) {
-    // Nearby names are hidden: of the networks in range only the current
-    // one is known by name, so that is all the list can offer.
-    struct wifi_network network = { .signal = -1,
-                                    .secure = true,
-                                    .known = true,
-                                    .current = true };
-    snprintf(network.ssid, sizeof(network.ssid), "%s", current_name);
-    g_state.wifi[g_state.wifi_count++] = network;
+    if (percent) CFRelease(percent);
+    if (address) CFRelease(address);
+    IOObjectRelease(service);
   }
-
-  if (g_scan_had_names) {
-    qsort(g_state.wifi, g_state.wifi_count, sizeof(struct wifi_network),
-          compare_networks                                          );
-  }
-
-  // Being on a network proves its password works: drop a remembered one.
-  if (current_name[0]) forget_password(current_name);
+  IOObjectRelease(iterator);
 }
 
-// ------------------------------------------------------------ refresh
+// Background queue. The levels system_profiler lists for connected devices
+// (device_batteryLevelMain, or Left/Right for earbuds: the lower one).
+static void read_profiler_batteries(struct battery_list* list) {
+  NSTask* task = [[NSTask alloc] init];
+  task.executableURL = [NSURL fileURLWithPath:@"/usr/sbin/system_profiler"];
+  task.arguments = @[ @"SPBluetoothDataType", @"-json" ];
+  NSPipe* pipe = [NSPipe pipe];
+  task.standardOutput = pipe;
+  task.standardError = [NSFileHandle fileHandleWithNullDevice];
+
+  NSData* data = nil;
+  if ([task launchAndReturnError:NULL]) {
+    data = [[pipe fileHandleForReading] readDataToEndOfFile];
+    [task waitUntilExit];
+  }
+  [task release];
+  if (!data) return;
+
+  id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+  NSArray* root = [json isKindOfClass:[NSDictionary class]]
+                  ? json[@"SPBluetoothDataType"] : nil;
+  if (![root isKindOfClass:[NSArray class]]) return;
+
+  for (NSDictionary* controller in root) {
+    if (![controller isKindOfClass:[NSDictionary class]]) continue;
+    NSArray* connected = controller[@"device_connected"];
+    if (![connected isKindOfClass:[NSArray class]]) continue;
+
+    for (NSDictionary* entry in connected) {
+      if (![entry isKindOfClass:[NSDictionary class]]) continue;
+      for (NSDictionary* device in entry.allValues) {
+        if (![device isKindOfClass:[NSDictionary class]]) continue;
+        NSString* address = device[@"device_address"];
+        if (![address isKindOfClass:[NSString class]]) continue;
+
+        int main = -1, lowest = -1;
+        for (NSString* key in device) {
+          if (![key hasPrefix:@"device_batteryLevel"]) continue;
+          id value = device[key];
+          if (![value isKindOfClass:[NSString class]]) continue;
+          int percent = [(NSString*)value intValue];  // "85%" -> 85
+          if ([key isEqualToString:@"device_batteryLevelMain"]) main = percent;
+          else if (![key isEqualToString:@"device_batteryLevelCase"]
+                   && (lowest < 0 || percent < lowest)) {
+            lowest = percent;
+          }
+        }
+        battery_list_add(list, [address UTF8String],
+                         main >= 0 ? main : lowest );
+      }
+    }
+  }
+}
+
+static void apply_batteries(void);
+
+static void read_batteries() {
+  if (g_battery_running || !g_state.bluetooth_on) return;
+  g_battery_running = true;
+  uint64_t generation = g_generation;
+
+  dispatch_async(g_queue, ^{
+    struct battery_list list;
+    memset(&list, 0, sizeof(list));
+    @autoreleasepool {
+      read_registry_batteries(&list);
+      read_profiler_batteries(&list);
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+      g_battery_running = false;
+      if (generation != g_generation) return;
+      g_batteries = list;
+      apply_batteries();
+    });
+  });
+}
 
 // Main thread: cheap reads only.
 static void refresh_state() {
   struct connections before = g_state;
 
   @autoreleasepool {
-    CWInterface* wifi = wifi_interface();
-    g_state.wifi_available = wifi != nil;
-    g_state.wifi_on = wifi && wifi.powerOn;
-    rebuild_wifi_list(g_state.wifi_on ? current_ssid() : nil);
-
     g_state.bluetooth_available = [IOBluetoothHostController defaultController]
                                   != nil;
     g_state.bluetooth_on = g_state.bluetooth_available
@@ -251,118 +210,26 @@ static void refresh_state() {
         copy_string(entry->address, sizeof(entry->address),
                     device.addressString                );
         entry->connected = device.isConnected;
+        entry->battery = entry->connected ? battery_for(entry->address) : -1;
       }
     }
+  }
+
+  // A device (dis)connected: its battery may be known now.
+  int connected = 0;
+  for (int i = 0; i < g_state.bluetooth_count; i++) {
+    if (g_state.bluetooth[i].connected) connected++;
+  }
+  if (connected != g_connected_count) {
+    g_connected_count = connected;
+    read_batteries();
   }
 
   if (memcmp(&before, &g_state, sizeof(g_state)) != 0) notify();
 }
 
-static void read_saved_networks() {
-  uint64_t generation = g_generation;
-  NSString* interface = [wifi_interface().interfaceName copy];
-  if (!interface) return;
-
-  dispatch_async(g_queue, ^{
-    @autoreleasepool {
-      NSString* output = run_tool(NETWORKSETUP,
-                                  @[ @"-listpreferredwirelessnetworks",
-                                     interface                        ]);
-      NSArray* lines = [output componentsSeparatedByString:@"\n"];
-
-      // Copied into a plain struct for the trip back to the main thread.
-      struct { int count; char names[CONNECTIONS_MAX_ITEMS * 4]
-                                     [CONNECTIONS_NAME]; } saved;
-      saved.count = 0;
-      for (NSUInteger i = 1; i < lines.count; i++) {
-        NSString* name = [lines[i] stringByTrimmingCharactersInSet:
-                           [NSCharacterSet whitespaceCharacterSet]];
-        if (name.length == 0 || saved.count >= CONNECTIONS_MAX_ITEMS * 4)
-          continue;
-        copy_string(saved.names[saved.count++], CONNECTIONS_NAME, name);
-      }
-
-      dispatch_async(dispatch_get_main_queue(), ^{
-        if (generation != g_generation) return;
-        g_saved_count = saved.count;
-        memcpy(g_saved, saved.names, sizeof(saved.names));
-        refresh_state();
-      });
-    }
-    [interface release];
-  });
-}
-
-// One scan's networks, one entry per name (its strongest access point).
-// Plain data, so it can travel between threads in a block.
-struct scan_list {
-  int count;
-  bool had_names;
-  struct wifi_network networks[CONNECTIONS_MAX_ITEMS];
-};
-
-static void scan_list_add(struct scan_list* scan,
-                          NSString* name,
-                          NSInteger rssi,
-                          bool secure      ) {
-  if (![name isKindOfClass:[NSString class]] || name.length == 0) return;
-
-  char ssid[CONNECTIONS_NAME];
-  copy_string(ssid, sizeof(ssid), name);
-  int bars = signal_bars(rssi);
-  for (int i = 0; i < scan->count; i++) {
-    if (strcmp(scan->networks[i].ssid, ssid) != 0) continue;
-    scan->networks[i].signal = max(scan->networks[i].signal, bars);
-    return;
-  }
-  if (scan->count >= CONNECTIONS_MAX_ITEMS) return;
-
-  struct wifi_network* entry = &scan->networks[scan->count++];
-  memset(entry, 0, sizeof(*entry));
-  snprintf(entry->ssid, sizeof(entry->ssid), "%s", ssid);
-  entry->signal = bars;
-  entry->secure = secure;
-}
-
-// Main thread.
-static void apply_scan(const struct scan_list* scan) {
-  g_scan_running = false;
-  g_state.wifi_scanning = false;
-  g_scan_done = true;
-  g_scan_had_names = scan->had_names;
-  g_scanned_count = scan->count;
-  memcpy(g_scanned, scan->networks, sizeof(scan->networks));
+static void apply_batteries(void) {
   refresh_state();
-  notify();
-}
-
-static void scan_wifi() {
-  if (g_scan_running || !g_state.wifi_on) return;
-  g_scan_running = true;
-  g_state.wifi_scanning = true;
-  notify();
-  uint64_t generation = g_generation;
-
-  // Names stay hidden unless macOS grants Location access, which this binary
-  // doesn't get: then only the current network is listed (see
-  // rebuild_wifi_list).
-  dispatch_async(g_queue, ^{
-    struct scan_list scan;
-    memset(&scan, 0, sizeof(scan));
-    @autoreleasepool {
-      NSSet* networks = [wifi_interface() scanForNetworksWithName:nil
-                                                            error:NULL];
-      for (CWNetwork* network in networks) {
-        if (network.ssid) scan.had_names = true;
-        scan_list_add(&scan, network.ssid, network.rssiValue,
-                      ![network supportsSecurity:kCWSecurityNone]);
-      }
-    }
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-      if (generation == g_generation) apply_scan(&scan);
-    });
-  });
 }
 
 // ------------------------------------------------------------ results
@@ -384,18 +251,14 @@ static void finish_attempt(uint64_t attempt, bool succeeded) {
   });
 }
 
-static uint64_t begin_attempt(const char* target, bool bluetooth,
-                              bool disconnect                     ) {
+static uint64_t begin_attempt(const char* target, bool disconnect) {
   g_state.status = CONNECTION_CONNECTING;
-  g_state.status_bluetooth = bluetooth;
   g_state.status_disconnect = disconnect;
   snprintf(g_state.status_target, sizeof(g_state.status_target), "%s",
            target                                                     );
   notify();
   return ++g_attempt;
 }
-
-// ------------------------------------------------------------ delegates
 
 @interface connections_delegate : NSObject
 @end
@@ -418,21 +281,27 @@ static uint64_t begin_attempt(const char* target, bool bluetooth,
 
 void connections_start(connections_callback* on_change) {
   if (g_callback) return;
-  if (!g_queue) {
-    g_queue = dispatch_queue_create("sketchybar.connections",
-                                    DISPATCH_QUEUE_SERIAL    );
-  }
   if (!g_delegate) g_delegate = [[connections_delegate alloc] init];
+  if (!g_queue) {
+    g_queue = dispatch_queue_create("sketchybar.bluetooth",
+                                    DISPATCH_QUEUE_SERIAL  );
+  }
 
   g_callback = on_change;
   g_generation++;
-  g_scan_running = false;
-  g_state.wifi_scanning = false;
   g_state.status = CONNECTION_IDLE;
-
+  g_connected_count = -1;  // reads the batteries right away
   refresh_state();
-  read_saved_networks();
-  scan_wifi();
+
+  g_battery_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                           dispatch_get_main_queue()       );
+  dispatch_source_set_timer(g_battery_timer,
+                            dispatch_time(DISPATCH_TIME_NOW,
+                                          CONNECTIONS_BATTERY * NSEC_PER_SEC),
+                            CONNECTIONS_BATTERY * NSEC_PER_SEC,
+                            5 * NSEC_PER_SEC                                 );
+  dispatch_source_set_event_handler(g_battery_timer, ^{ read_batteries(); });
+  dispatch_resume(g_battery_timer);
 
   g_refresh_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                                            dispatch_get_main_queue()       );
@@ -443,16 +312,6 @@ void connections_start(connections_callback* on_change) {
                             0.5 * NSEC_PER_SEC                               );
   dispatch_source_set_event_handler(g_refresh_timer, ^{ refresh_state(); });
   dispatch_resume(g_refresh_timer);
-
-  g_scan_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-                                        dispatch_get_main_queue()       );
-  dispatch_source_set_timer(g_scan_timer,
-                            dispatch_time(DISPATCH_TIME_NOW,
-                                          CONNECTIONS_SCAN * NSEC_PER_SEC),
-                            CONNECTIONS_SCAN * NSEC_PER_SEC,
-                            2 * NSEC_PER_SEC                              );
-  dispatch_source_set_event_handler(g_scan_timer, ^{ scan_wifi(); });
-  dispatch_resume(g_scan_timer);
 }
 
 void connections_stop(void) {
@@ -463,39 +322,15 @@ void connections_stop(void) {
   dispatch_source_cancel(g_refresh_timer);
   dispatch_release(g_refresh_timer);
   g_refresh_timer = NULL;
-  dispatch_source_cancel(g_scan_timer);
-  dispatch_release(g_scan_timer);
-  g_scan_timer = NULL;
-
-  // Keep the saved networks and the last scan: reopening the tab then shows
-  // a list right away while the fresh scan runs.
-  g_scan_running = false;
-  g_state.wifi_scanning = false;
+  dispatch_source_cancel(g_battery_timer);
+  dispatch_release(g_battery_timer);
+  g_battery_timer = NULL;
+  g_battery_running = false;
   g_state.status = CONNECTION_IDLE;
 }
 
 const struct connections* connections_get(void) {
   return &g_state;
-}
-
-void connections_set_wifi_power(bool on) {
-  if (!g_callback) return;
-  NSString* interface = [wifi_interface().interfaceName copy];
-  if (!interface) return;
-
-  uint64_t generation = g_generation;
-  dispatch_async(g_queue, ^{
-    @autoreleasepool {
-      run_tool(NETWORKSETUP, @[ @"-setairportpower", interface,
-                                on ? @"on" : @"off"           ]);
-    }
-    [interface release];
-    dispatch_async(dispatch_get_main_queue(), ^{
-      if (generation != g_generation) return;
-      refresh_state();
-      if (on) scan_wifi();
-    });
-  });
 }
 
 void connections_set_bluetooth_power(bool on) {
@@ -509,63 +344,6 @@ void connections_set_bluetooth_power(bool on) {
                  ^{ if (generation == g_generation) refresh_state(); });
 }
 
-void connections_join_wifi(const char* ssid_c, const char* password_c) {
-  if (!g_callback || !ssid_c || !ssid_c[0]) return;
-  NSString* interface = [wifi_interface().interfaceName copy];
-  if (!interface) return;
-
-  uint64_t attempt = begin_attempt(ssid_c, false, false);
-  uint64_t generation = g_generation;
-  NSString* ssid = [@(ssid_c) copy];
-  NSString* password = password_c ? [@(password_c) copy] : nil;
-
-  dispatch_async(g_queue, ^{
-    bool joined = false;
-    @autoreleasepool {
-      NSMutableArray* arguments = [NSMutableArray arrayWithObjects:
-                                    @"-setairportnetwork", interface, ssid,
-                                    nil                                    ];
-      if (password) [arguments addObject:password];
-
-      // networksetup exits with 0 either way; it only prints on failure
-      // ("Could not find network …", "Failed to join network …").
-      NSString* output = run_tool(NETWORKSETUP, arguments);
-      joined = output && output.length == 0;
-
-      // Double check that we are on it now.
-      if (joined) {
-        NSString* current = current_ssid();
-        if (current && ![current isEqualToString:ssid]) joined = false;
-      }
-    }
-
-    char ssid_copy[CONNECTIONS_NAME];
-    char password_copy[PASSWORD_LENGTH];
-    copy_string(ssid_copy, sizeof(ssid_copy), ssid);
-    copy_string(password_copy, sizeof(password_copy), password);
-    bool had_password = password != nil;
-    [interface release];
-    [ssid release];
-    [password release];
-
-    // Plain struct: C arrays can't be captured by a block directly.
-    struct { char ssid[CONNECTIONS_NAME]; char password[PASSWORD_LENGTH]; }
-      result;
-    memcpy(result.ssid, ssid_copy, sizeof(result.ssid));
-    memcpy(result.password, password_copy, sizeof(result.password));
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-      // Remembered even if the tab closed meanwhile.
-      if (joined) forget_password(result.ssid);
-      else if (had_password) remember_failure(result.ssid, result.password);
-
-      if (generation != g_generation) return;
-      if (joined) read_saved_networks();  // it is saved now
-      finish_attempt(attempt, joined);
-    });
-  });
-}
-
 void connections_toggle_bluetooth(const char* address) {
   if (!g_callback || !address) return;
 
@@ -576,12 +354,12 @@ void connections_toggle_bluetooth(const char* address) {
 
     const char* name = device.name ? [device.name UTF8String] : address;
     if (device.isConnected) {
-      uint64_t attempt = begin_attempt(name, true, true);
+      uint64_t attempt = begin_attempt(name, true);
       finish_attempt(attempt, [device closeConnection] == kIOReturnSuccess);
       return;
     }
 
-    uint64_t attempt = begin_attempt(name, true, false);
+    uint64_t attempt = begin_attempt(name, false);
     g_bluetooth_attempt = attempt;
     snprintf(g_bluetooth_address, sizeof(g_bluetooth_address), "%s",
              [device.addressString UTF8String]                       );

@@ -11,15 +11,17 @@
 #define BAR_NOTCH_COLLAPSED_WIDTH 218
 #define BAR_NOTCH_EXPANDED_WIDTH  291
 #define BAR_NOTCH_EXPANDED_HEIGHT 183
-// Expanded width while the Wi-Fi password prompt is open, and how long the
-// island takes to widen (60Hz frames).
-#define BAR_NOTCH_WIDE_WIDTH      371
-#define BAR_WIDE_DURATION         20
-// Connections tab switches: slide duration (60Hz frames), and how long a
+// Wi-Fi / Bluetooth switches: slide duration (60Hz frames), and how long a
 // clicked switch shows the new state before falling back to the real one
 // (when the change didn't happen).
 #define BAR_TOGGLE_DURATION       14
 #define BAR_TOGGLE_PENDING        5.0
+
+// System Settings pages behind the settings buttons.
+#define BAR_WIFI_SETTINGS_URL \
+  "x-apple.systempreferences:com.apple.wifi-settings-extension"
+#define BAR_BLUETOOTH_SETTINGS_URL \
+  "x-apple.systempreferences:com.apple.BluetoothSettings"
 #define BAR_EXPAND_PROGRESS_MAX   1000
 #define BAR_EXPAND_DURATION       30
 
@@ -60,9 +62,6 @@ struct bar {
 
   struct window window;
   struct island island;
-  // Widened for the Wi-Fi prompt (target) and the animation's progress.
-  bool wide;
-  int wide_progress;
   // Screens tab: this display's desktops, read while the tab is shown.
   struct desktops desktops;
   int desktops_problem;
