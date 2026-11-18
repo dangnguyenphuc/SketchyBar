@@ -27,6 +27,8 @@
 #define BAR_PEEK_HOLD             2.5
 #define BAR_PEEK_PADDING          10
 #define BAR_PEEK_ICON             22
+// Only notifications at most this many seconds old peek.
+#define BAR_PEEK_RECENT           15.0
 
 // System Settings pages behind the settings buttons.
 #define BAR_WIFI_SETTINGS_URL \

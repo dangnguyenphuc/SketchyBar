@@ -352,6 +352,10 @@ static void bar_island_perform(struct bar* bar, struct island_action* action) {
       notifications_open(action->index);
       island_clamp_scroll(&bar->island, bar_get_island_panel(bar));
       break;
+    case ISLAND_ACTION_NOTIFICATION_DISMISS:
+      notifications_dismiss(action->index);
+      island_clamp_scroll(&bar->island, bar_get_island_panel(bar));
+      break;
     case ISLAND_ACTION_NOTIFICATIONS_READ_ALL:
       notifications_read_all();
       island_clamp_scroll(&bar->island, bar_get_island_panel(bar));
@@ -1296,8 +1300,12 @@ static CFAbsoluteTime g_peek_time = 0;
 
 static void bar_island_notifications_changed(void) {
   const struct notification_list* list = notifications_get();
-  bool arrived = list->count > 0 && list->items[0].time > g_peek_time;
-  if (arrived) g_peek_time = list->items[0].time;
+  // Only what just arrived: not the stored history read at start.
+  CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+  bool arrived = list->count > 0 && list->items[0].time > g_peek_time
+                 && list->items[0].time > now - BAR_PEEK_RECENT;
+  if (list->count > 0 && list->items[0].time > g_peek_time)
+    g_peek_time = list->items[0].time;
 
   for (int i = 0; i < g_bar_manager.bar_count; i++) {
     struct bar* bar = g_bar_manager.bars[i];

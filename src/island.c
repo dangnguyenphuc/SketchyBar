@@ -35,6 +35,8 @@
 #define ISLAND_CARD_EXIT       40
 #define ISLAND_CARD_LEAVE      0.24
 #define ISLAND_CARD_STAGGER    0.04
+// The close button on notification cards.
+#define ISLAND_CARD_CLOSE      14
 
 // App icon on notification cards.
 #define ISLAND_APP_ICON_SIZE   30
@@ -803,6 +805,14 @@ static void island_draw_app_icon(CGContextRef context,
                     ISLAND_COLOR_WHITE, 1.0, rect             );
 }
 
+// The card's close button (top right): marks it read without opening it.
+static CGRect island_card_close_rect(CGRect card) {
+  return (CGRect){{ CGRectGetMaxX(card) - ISLAND_CARD_INSET + 3
+                                        - ISLAND_CARD_CLOSE,
+                    CGRectGetMaxY(card) - 5 - ISLAND_CARD_CLOSE },
+                  { ISLAND_CARD_CLOSE, ISLAND_CARD_CLOSE }};
+}
+
 static void island_draw_card(CGContextRef context,
                              const struct notification_item* notification,
                              CGRect card                                  ) {
@@ -824,14 +834,23 @@ static void island_draw_card(CGContextRef context,
   CGFloat width = right - x;
   CGFloat top = CGRectGetMaxY(card);
 
+  // Close button, the time left of it.
+  CGRect close = island_card_close_rect(card);
+  island_draw_glass(context, close, close.size.width / 2.0, 1.3);
+  island_draw_glyph(context, g_glyphs[GLYPH_CROSS], g_fonts.stats_icon,
+                    ISLAND_COLOR_WHITE, 0.8, close                     );
+
   char time[16];
   island_relative_time(notification->time, time, sizeof(time));
+  CGFloat time_right = close.origin.x - 5;
   CGFloat time_width = island_draw_text(context, time,
                                         g_fonts.caption, 0.5,
-                                        right, top - 13, width, ALIGN_RIGHT);
+                                        time_right, top - 13,
+                                        time_right - x, ALIGN_RIGHT);
 
   island_draw_text(context, notification->app, g_fonts.caption, 0.55,
-                   x, top - 13, width - time_width - 6, ALIGN_LEFT);
+                   x, top - 13, time_right - x - time_width - 6,
+                   ALIGN_LEFT                                   );
   island_draw_text(context, notification->title, g_fonts.title, 0.95,
                    x, top - 27, width, ALIGN_LEFT);
   island_draw_text(context, notification->body, g_fonts.body, 0.7,
@@ -989,7 +1008,9 @@ static void island_draw_alerts(CGContextRef context,
                                struct island_layout* layout,
                                CGFloat scroll_offset       ) {
   const struct notification_list* notifications = notifications_get();
-  if (!notifications->trusted) {
+  // Neither source readable: banners need Accessibility, Notification
+  // Center's history Full Disk Access.
+  if (!notifications->trusted && !notifications->history) {
     island_draw_placeholder(context, layout,
                             "Allow SketchyBar in Accessibility");
     return;
@@ -1004,8 +1025,10 @@ static void island_draw_alerts(CGContextRef context,
   // last cards are sliding out).
   CGRect header = island_alerts_header(layout);
   if (notifications->count > 0) {
-    char count[24];
-    snprintf(count, sizeof(count), "%d unread", notifications->count);
+    char count[48];
+    snprintf(count, sizeof(count),
+             notifications->history ? "%d unread" : "%d unread (banners only)",
+             notifications->count                                          );
     island_draw_text(context, count, g_fonts.caption, 0.55,
                      header.origin.x, CGRectGetMidY(header) - 3,
                      header.size.width - ISLAND_READ_ALL_WIDTH - 8,
@@ -2287,7 +2310,13 @@ bool island_handle_click(struct island* island,
       }
       int index = island_notification_index(card->item.id);
       if (index < 0) return true;
-      action->type = ISLAND_ACTION_NOTIFICATION_OPEN;
+      // The close button only marks it read; the rest opens the app.
+      CGRect frame = island_card_frame(&layout, card, island->scroll_offset);
+      bool close = CGRectContainsPoint(
+                     CGRectInset(island_card_close_rect(frame), -4, -4),
+                     point                                           );
+      action->type = close ? ISLAND_ACTION_NOTIFICATION_DISMISS
+                           : ISLAND_ACTION_NOTIFICATION_OPEN;
       action->index = index;
       return true;
     }

@@ -119,6 +119,7 @@ enum island_action_type {
   ISLAND_ACTION_SCREEN_SELECT,
   ISLAND_ACTION_SET_BRIGHTNESS,
   ISLAND_ACTION_NOTIFICATION_OPEN,
+  ISLAND_ACTION_NOTIFICATION_DISMISS,
   ISLAND_ACTION_NOTIFICATIONS_READ_ALL
 };
 
@@ -126,8 +127,8 @@ struct island_action {
   enum island_action_type type;
   float value;   // SET_VOLUME / SET_BRIGHTNESS: 0..1
   int index;     // BLUETOOTH_SELECT: index into the device list;
-                 // SCREEN_SELECT: the desktop; NOTIFICATION_OPEN: index
-                 // into the captured notifications
+                 // SCREEN_SELECT: the desktop; NOTIFICATION_OPEN/DISMISS:
+                 // index into the captured notifications
 };
 
 // `family` is the text font family (the bar's default font); NULL uses the
