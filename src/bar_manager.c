@@ -39,6 +39,9 @@ void bar_manager_init(struct bar_manager* bar_manager) {
   bar_manager->notch_width = 200;
   bar_manager->notch_offset = 0;
   bar_manager->notch_display_height = 0;
+  bar_manager->island_idle_timeout = BAR_ISLAND_IDLE_TIMEOUT;
+  bar_manager->notification_peek_hold = BAR_PEEK_HOLD;
+  bar_manager->notification_peek_chars = ISLAND_PEEK_CHARS;
   bar_manager->active_adid = display_active_display_adid();
   bar_manager->might_need_clipping = false;
 

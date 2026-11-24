@@ -89,6 +89,10 @@
 #define ISLAND_CONTROL_GAP    8
 #define ISLAND_NOTICE_BAR     22
 
+// Apps tab: a header, one row per app (icon, name, switch) below it.
+#define ISLAND_APP_ROW        22
+#define ISLAND_APP_ROW_ICON   16
+
 // Screens tab: 3 x 2 tiles, the hint line below them when switching can't
 // work.
 #define ISLAND_SCREEN_COLUMNS 3
@@ -116,17 +120,86 @@
 
 // The services column shows Nerd Font icons (Font Awesome: bell, music,
 // calendar). Without FuraCode Nerd Font installed those glyphs don't exist,
-// so the column falls back to the service's initial.
+// so the column falls back to the service's initial. `name` is what
+// island_tabs calls it.
 static const struct {
+  const char* name;
   const char* icon;
   const char* fallback;
 } g_services[ISLAND_SERVICE_COUNT] = {
-  [ISLAND_SERVICE_ALERTS]   = { "\xEF\x83\xB3", "A" },  // U+F0F3
-  [ISLAND_SERVICE_MUSIC]    = { "\xEF\x80\x81", "M" },  // U+F001
-  [ISLAND_SERVICE_SYSTEM]   = { "\xEF\x87\xBE", "S" },  // U+F1FE area-chart
-  [ISLAND_SERVICE_BLUETOOTH] = { "\xEF\x8A\x93", "B" },  // U+F293 bluetooth
-  [ISLAND_SERVICE_SCREENS]  = { "\xEF\x80\x89", "D" },  // U+F009 th-large
+  [ISLAND_SERVICE_ALERTS]    = { "alerts",    "\xEF\x83\xB3", "A" },  // U+F0F3 bell
+  [ISLAND_SERVICE_MUSIC]     = { "music",     "\xEF\x80\x81", "M" },  // U+F001
+  [ISLAND_SERVICE_SYSTEM]    = { "system",    "\xEF\x87\xBE", "S" },  // U+F1FE area-chart
+  [ISLAND_SERVICE_BLUETOOTH] = { "bluetooth", "\xEF\x8A\x93", "B" },  // U+F293 bluetooth
+  [ISLAND_SERVICE_SCREENS]   = { "screens",   "\xEF\x80\x89", "D" },  // U+F009 th-large
+  [ISLAND_SERVICE_APPS]      = { "apps",      "\xEF\x87\x9E", "N" },  // U+F1DE sliders
 };
+
+// The column's tabs, top to bottom (see island_set_tabs).
+static int g_tabs[ISLAND_SERVICE_COUNT] = { ISLAND_SERVICE_ALERTS,
+                                            ISLAND_SERVICE_MUSIC,
+                                            ISLAND_SERVICE_SYSTEM,
+                                            ISLAND_SERVICE_BLUETOOTH,
+                                            ISLAND_SERVICE_APPS       };
+static int g_tab_count = 5;
+
+bool island_set_tabs(const char* list, char* error, size_t size) {
+  int tabs[ISLAND_SERVICE_COUNT];
+  int count = 0;
+  char buffer[256];
+  snprintf(buffer, sizeof(buffer), "%s", list ? list : "");
+
+  char* cursor = buffer;
+  char* part;
+  while ((part = strsep(&cursor, ",")) != NULL) {
+    while (*part == ' ') part++;
+    char* end = part + strlen(part);
+    while (end > part && end[-1] == ' ') *--end = '\0';
+    if (!*part) continue;
+
+    int service = -1;
+    for (int i = 0; i < ISLAND_SERVICE_COUNT; i++) {
+      if (strcasecmp(part, g_services[i].name) == 0) service = i;
+    }
+    if (service < 0) {
+      snprintf(error, size, "unknown tab '%s' (alerts, music, system, "
+                            "bluetooth, screens, apps)", part         );
+      return false;
+    }
+    bool duplicate = false;
+    for (int i = 0; i < count; i++) duplicate |= tabs[i] == service;
+    if (!duplicate) tabs[count++] = service;
+  }
+  if (count == 0) {
+    snprintf(error, size, "no tabs given");
+    return false;
+  }
+
+  memcpy(g_tabs, tabs, count * sizeof(int));
+  g_tab_count = count;
+  return true;
+}
+
+// Where `service` is in the column, -1 if it isn't shown.
+static int island_tab_slot(int service) {
+  for (int i = 0; i < g_tab_count; i++) {
+    if (g_tabs[i] == service) return i;
+  }
+  return -1;
+}
+
+// After the tabs changed: a service that is no longer shown falls back to
+// the first tab.
+static void island_fix_service(struct island* island) {
+  if (island_tab_slot(island->service) < 0) {
+    island->service = g_tabs[0];
+    island->scroll_offset = 0;
+    island->scroll_target = 0;
+    island->transition = 1.0;
+  }
+  if (island_tab_slot(island->previous_service) < 0)
+    island->previous_service = island->service;
+}
 
 static struct {
   CTFontRef caption;   // app name, time, install hint
@@ -148,7 +221,7 @@ enum island_glyph {
   GLYPH_VOLUME, GLYPH_VOLUME_LOW, GLYPH_MUTED,
   GLYPH_APPLE, GLYPH_WIFI, GLYPH_ETHERNET,
   GLYPH_BLUETOOTH, GLYPH_LOCK, GLYPH_CHECK, GLYPH_CROSS, GLYPH_BACK,
-  GLYPH_SUN, GLYPH_SETTINGS,
+  GLYPH_SUN, GLYPH_SETTINGS, GLYPH_BELL,
   GLYPH_BATTERY_0, GLYPH_BATTERY_1, GLYPH_BATTERY_2, GLYPH_BATTERY_3,
   GLYPH_BATTERY_4, GLYPH_COUNT
 };
@@ -173,6 +246,7 @@ static const struct {
   [GLYPH_BACK]       = { "\xEF\x81\x93", "<"  },  // U+F053 chevron-left
   [GLYPH_SUN]        = { "\xEF\x86\x85", "*"  },  // U+F185 sun
   [GLYPH_SETTINGS]   = { "\xEF\x80\x93", "S"  },  // U+F013 cog
+  [GLYPH_BELL]       = { "\xEF\x83\xB3", "!"  },  // U+F0F3 bell
   [GLYPH_BATTERY_0]  = { "\xEF\x89\x84", "["  },  // U+F244 battery-empty
   [GLYPH_BATTERY_1]  = { "\xEF\x89\x83", "["  },  // U+F243 battery-quarter
   [GLYPH_BATTERY_2]  = { "\xEF\x89\x82", "["  },  // U+F242 battery-half
@@ -275,6 +349,7 @@ static CTFontRef island_create_font(const char* family,
 static void island_pick_app_icon_marks();
 
 void island_open(struct island* island, const char* family) {
+  island_fix_service(island);
   island->scroll_offset = 0;
   island->scroll_target = 0;
   island->previous_service = island->service;
@@ -282,6 +357,7 @@ void island_open(struct island* island, const char* family) {
   island->transition = 1.0;
   island->toggles_ready = false;
   island->cards_synced = false;
+  island->app_toggle_progress = 1.0;
   if (g_loaded) return;
 
   if (!family) family = font_default_family();
@@ -344,9 +420,12 @@ void island_release(void) {
 
 // ---------------------------------------------------------------- layout
 
+// `services` and `service_hits` are per slot (g_tabs order): the selection
+// pill, and the whole share of the column that selects it.
 struct island_layout {
   CGRect content;
   CGRect services[ISLAND_SERVICE_COUNT];
+  CGRect service_hits[ISLAND_SERVICE_COUNT];
   CGRect divider;
   CGRect list;
   CGRect scroll_track;
@@ -364,13 +443,20 @@ static struct island_layout island_get_layout(CGRect panel) {
                               panel.size.height - bottom
                                                 - ISLAND_PADDING_TOP }};
 
+  // The column is stretched: each tab gets an equal share of its height,
+  // its pill centered in it (shorter when many tabs leave less room).
   CGFloat top = CGRectGetMaxY(layout.content);
-  for (int i = 0; i < ISLAND_SERVICE_COUNT; i++) {
+  CGFloat slot = layout.content.size.height / max(g_tab_count, 1);
+  CGFloat pill = max(min(ISLAND_SERVICE_HEIGHT, slot - ISLAND_SERVICE_GAP),
+                     ISLAND_ICON_SIZE                                      );
+  for (int i = 0; i < g_tab_count; i++) {
+    CGFloat mid = top - (i + 0.5) * slot;
     layout.services[i] = (CGRect){{ layout.content.origin.x,
-                                    top - (i + 1)*ISLAND_SERVICE_HEIGHT
-                                        - i*ISLAND_SERVICE_GAP          },
-                                  { ISLAND_SERVICE_WIDTH,
-                                    ISLAND_SERVICE_HEIGHT }};
+                                    round(mid - pill / 2.0) },
+                                  { ISLAND_SERVICE_WIDTH, pill }};
+    layout.service_hits[i] = (CGRect){{ layout.content.origin.x,
+                                        top - (i + 1) * slot     },
+                                      { ISLAND_SERVICE_WIDTH, slot }};
   }
 
   CGFloat divider_x = layout.content.origin.x + ISLAND_SERVICE_WIDTH
@@ -578,18 +664,23 @@ static void island_draw_services(struct island* island,
                                  struct island_layout* layout) {
   // The selection pill glides from the previous row to the new one.
   double t = island_transition_progress(island);
-  CGRect from = layout->services[island->previous_service];
-  CGRect pill = layout->services[island->service];
+  int slot = island_tab_slot(island->service);
+  int previous = island_tab_slot(island->previous_service);
+  if (slot < 0) return;
+  if (previous < 0) previous = slot;
+  CGRect from = layout->services[previous];
+  CGRect pill = layout->services[slot];
   pill.origin.y = from.origin.y + (pill.origin.y - from.origin.y) * t;
   island_draw_glass(context, pill, 7, 1.0);
 
-  for (int i = 0; i < ISLAND_SERVICE_COUNT; i++) {
+  for (int i = 0; i < g_tab_count; i++) {
     CGRect row = layout->services[i];
+    int service = g_tabs[i];
 
     // How "selected" the row is right now, so the icons cross-fade too.
     double weight = 0;
-    if (i == island->service) weight += t;
-    if (i == island->previous_service) weight += 1.0 - t;
+    if (service == island->service) weight += t;
+    if (service == island->previous_service) weight += 1.0 - t;
 
     // Center the glyph vertically on its line box.
     CGFloat baseline = CGRectGetMidY(row)
@@ -597,7 +688,8 @@ static void island_draw_services(struct island* island,
                           - CTFontGetDescent(g_fonts.icon)) / 2.0;
 
     island_draw_text(context,
-                     g_has_icons ? g_services[i].icon : g_services[i].fallback,
+                     g_has_icons ? g_services[service].icon
+                                 : g_services[service].fallback,
                      g_fonts.icon,
                      0.5 + 0.5 * weight,
                      CGRectGetMidX(row),
@@ -606,7 +698,7 @@ static void island_draw_services(struct island* island,
                      ALIGN_CENTER                                            );
 
     // Unread dot instead of a count, the column is only an icon wide.
-    if (i == ISLAND_SERVICE_ALERTS && notifications_get()->count > 0) {
+    if (service == ISLAND_SERVICE_ALERTS && notifications_get()->count > 0) {
       CGContextSetRGBFillColor(context, 1.0, 0.36, 0.33, 0.95);
       CGContextFillEllipseInRect(context,
                                  CGRectMake(CGRectGetMaxX(row) - 7,
@@ -857,21 +949,21 @@ static void island_draw_card(CGContextRef context,
                    x, top - 40, width, ALIGN_LEFT);
 }
 
-static void island_draw_scroll_indicator(CGContextRef context,
-                                         struct island_layout* layout,
-                                         CGFloat scroll_offset       ) {
-  CGFloat max_scroll = island_max_scroll(layout);
+// A scroll bar in `track` for a list of `content` points of which `visible`
+// show, scrolled by `scroll_offset`. Nothing when it all fits.
+static void island_draw_scroll_bar(CGContextRef context,
+                                   CGRect track,
+                                   CGFloat content,
+                                   CGFloat visible_height,
+                                   CGFloat scroll_offset  ) {
+  CGFloat max_scroll = content - visible_height;
   if (max_scroll <= 0) return;
 
-  CGRect list = island_alerts_list(layout);
-  CGRect track = layout->scroll_track;
-  track.origin.y = list.origin.y;
-  track.size.height = list.size.height;
   island_add_rounded_rect(context, track, track.size.width / 2.0);
   CGContextSetRGBFillColor(context, 1, 1, 1, 0.10);
   CGContextFillPath(context);
 
-  CGFloat visible = list.size.height / island_list_height();
+  CGFloat visible = visible_height / content;
   CGFloat thumb_height = max(track.size.height * visible, ISLAND_SCROLL_MIN);
   CGFloat progress = scroll_offset / max_scroll;
 
@@ -883,6 +975,17 @@ static void island_draw_scroll_indicator(CGContextRef context,
   island_add_rounded_rect(context, thumb, track.size.width / 2.0);
   CGContextSetRGBFillColor(context, 1, 1, 1, 0.55);
   CGContextFillPath(context);
+}
+
+static void island_draw_scroll_indicator(CGContextRef context,
+                                         struct island_layout* layout,
+                                         CGFloat scroll_offset       ) {
+  CGRect list = island_alerts_list(layout);
+  CGRect track = layout->scroll_track;
+  track.origin.y = list.origin.y;
+  track.size.height = list.size.height;
+  island_draw_scroll_bar(context, track, island_list_height(),
+                         list.size.height, scroll_offset      );
 }
 
 static void island_draw_placeholder(CGContextRef context,
@@ -1936,6 +2039,147 @@ static bool island_handle_screens_click(struct island_layout* layout,
   return true;
 }
 
+// ---------------------------------------------------------------- apps
+
+// Which apps' notifications are captured: a header with how many are on,
+// one row per app (icon, name, switch) that scrolls like the Bluetooth list.
+// Clicking anywhere on a row flips its switch.
+struct island_apps_layout {
+  CGRect page;
+  CGRect header;
+  CGRect list;
+  CGRect track;
+};
+
+static struct island_apps_layout island_get_apps_layout(
+                                        struct island_layout* layout) {
+  struct island_apps_layout a;
+  a.page = island_page_rect(layout);
+  CGFloat top = CGRectGetMaxY(a.page);
+  a.header = (CGRect){{ a.page.origin.x, top - ISLAND_COLUMN_HEADER },
+                      { a.page.size.width, ISLAND_COLUMN_HEADER }};
+  CGFloat height = a.header.origin.y - 4 - a.page.origin.y;
+  a.track = (CGRect){{ CGRectGetMaxX(a.page) - ISLAND_SCROLL_WIDTH,
+                       a.page.origin.y                             },
+                     { ISLAND_SCROLL_WIDTH, height }};
+  a.list = (CGRect){{ a.page.origin.x, a.page.origin.y },
+                    { a.track.origin.x - ISLAND_SCROLL_GAP - a.page.origin.x,
+                      height                                               }};
+  return a;
+}
+
+static CGFloat island_apps_max_scroll(struct island_apps_layout* a) {
+  return max(notifications_apps()->count * ISLAND_APP_ROW
+             - a->list.size.height, 0                    );
+}
+
+static CGRect island_apps_row(struct island_apps_layout* a,
+                              int row,
+                              CGFloat scroll_offset        ) {
+  CGFloat top = CGRectGetMaxY(a->list) - row * ISLAND_APP_ROW + scroll_offset;
+  return (CGRect){{ a->list.origin.x, top - ISLAND_APP_ROW },
+                  { a->list.size.width, ISLAND_APP_ROW }};
+}
+
+// The switch's position: on/off, or sliding if it was just clicked.
+static double island_app_toggle_value(struct island* island,
+                                      const struct notification_app* app) {
+  double value = app->enabled ? 1.0 : 0.0;
+  if (island->app_toggle_progress < 1.0
+      && strcmp(island->app_toggle, app->name) == 0) {
+    double t = max(island->app_toggle_progress, 0.0);
+    value = app->enabled ? t : 1.0 - t;
+  }
+  return value;
+}
+
+static void island_draw_apps(CGContextRef context,
+                             struct island_layout* layout,
+                             CGFloat scroll_offset       ) {
+  if (!g_drawing) return;
+  struct island* island = g_drawing;
+  const struct notification_apps* apps = notifications_apps();
+  struct island_apps_layout a = island_get_apps_layout(layout);
+
+  // Header: bell, title, "N of M on".
+  int on = 0;
+  for (int i = 0; i < apps->count; i++) on += apps->items[i].enabled;
+  char count[32];
+  snprintf(count, sizeof(count), "%d of %d on", on, apps->count);
+  CGFloat count_width = island_draw_text(context, count, g_fonts.caption, 0.5,
+                                         CGRectGetMaxX(a.header),
+                                         CGRectGetMidY(a.header) - 3,
+                                         a.header.size.width, ALIGN_RIGHT);
+  CGRect icon = {{ a.header.origin.x, a.header.origin.y },
+                 { 14, a.header.size.height }};
+  island_draw_glyph(context, g_glyphs[GLYPH_BELL], g_fonts.small_icon,
+                    ISLAND_COLOR_WHITE, 0.9, icon                     );
+  island_draw_text(context, "Capture from", g_fonts.title, 0.95,
+                   a.header.origin.x + 18, CGRectGetMidY(a.header) - 4,
+                   a.header.size.width - 18 - count_width - 6, ALIGN_LEFT);
+
+  if (apps->count == 0) {
+    island_draw_bluetooth_message(context, a.list, "No apps found");
+    return;
+  }
+
+  CGContextSaveGState(context);
+  CGContextClipToRect(context, a.list);
+  for (int i = 0; i < apps->count; i++) {
+    CGRect row = island_apps_row(&a, i, scroll_offset);
+    if (!CGRectIntersectsRect(row, a.list)) continue;
+    const struct notification_app* app = &apps->items[i];
+    CGFloat mid = CGRectGetMidY(row);
+
+    // The cards' app icon, scaled down.
+    CGFloat scale = (CGFloat)ISLAND_APP_ROW_ICON / ISLAND_APP_ICON_SIZE;
+    CGContextSaveGState(context);
+    CGContextTranslateCTM(context, row.origin.x,
+                          mid - ISLAND_APP_ROW_ICON / 2.0);
+    CGContextScaleCTM(context, scale, scale);
+    if (!app->enabled) CGContextSetAlpha(context, 0.45);
+    island_draw_app_icon(context, app->name,
+                         CGRectMake(0, 0, ISLAND_APP_ICON_SIZE,
+                                    ISLAND_APP_ICON_SIZE       ));
+    CGContextRestoreGState(context);
+
+    CGRect toggle = {{ CGRectGetMaxX(row) - ISLAND_TOGGLE_WIDTH,
+                       mid - ISLAND_TOGGLE_HEIGHT / 2.0          },
+                     { ISLAND_TOGGLE_WIDTH, ISLAND_TOGGLE_HEIGHT }};
+    island_draw_toggle(context, toggle, island_app_toggle_value(island, app));
+
+    CGFloat x = row.origin.x + ISLAND_APP_ROW_ICON + 7;
+    island_draw_text(context, app->name, g_fonts.body,
+                     app->enabled ? 0.9 : 0.45,
+                     x, mid - 3, toggle.origin.x - 6 - x, ALIGN_LEFT);
+  }
+  CGContextRestoreGState(context);
+
+  island_draw_scroll_bar(context, a.track, apps->count * ISLAND_APP_ROW,
+                         a.list.size.height, scroll_offset             );
+}
+
+static bool island_handle_apps_click(struct island* island,
+                                     struct island_layout* layout,
+                                     CGPoint point,
+                                     struct island_action* action) {
+  struct island_apps_layout a = island_get_apps_layout(layout);
+  if (!CGRectContainsPoint(a.page, point)) return false;
+  if (!CGRectContainsPoint(a.list, point)) return true;
+
+  const struct notification_apps* apps = notifications_apps();
+  for (int i = 0; i < apps->count; i++) {
+    if (!CGRectContainsPoint(island_apps_row(&a, i, island->scroll_offset),
+                             point                                        )) {
+      continue;
+    }
+    action->type = ISLAND_ACTION_APP_TOGGLE;
+    action->index = i;
+    break;
+  }
+  return true;
+}
+
 static void island_draw_page(CGContextRef context,
                              struct island_layout* layout,
                              int service,
@@ -1955,6 +2199,9 @@ static void island_draw_page(CGContextRef context,
       break;
     case ISLAND_SERVICE_SCREENS:
       island_draw_screens(context, layout);
+      break;
+    case ISLAND_SERVICE_APPS:
+      island_draw_apps(context, layout, scroll_offset);
       break;
   }
 }
@@ -1987,7 +2234,8 @@ static void island_draw_pages(struct island* island,
   } else {
     // A lower service (higher index) pushes the pages up (y-up coordinates:
     // positive dy), an upper one pushes them down.
-    CGFloat direction = island->service > island->previous_service ? 1 : -1;
+    CGFloat direction = island_tab_slot(island->service)
+                        > island_tab_slot(island->previous_service) ? 1 : -1;
     CGFloat distance = page.size.height + ISLAND_PAGE_GAP;
     CGFloat fade = 1.0 - ISLAND_PAGE_MIN_ALPHA;
 
@@ -2127,6 +2375,7 @@ void island_draw(struct island* island,
 
   double alpha = island_content_alpha(progress);
   if (alpha <= 0) return;
+  island_fix_service(island);
   g_data = data;
   g_drawing = island;
 
@@ -2239,13 +2488,15 @@ bool island_handle_click(struct island* island,
     return true;
   }
 
-  for (int i = 0; i < ISLAND_SERVICE_COUNT; i++) {
-    if (CGRectContainsPoint(layout.services[i], point)) {
-      if (island->service != i) {
+  island_fix_service(island);
+  for (int i = 0; i < g_tab_count; i++) {
+    if (CGRectContainsPoint(layout.service_hits[i], point)) {
+      int service = g_tabs[i];
+      if (island->service != service) {
         // Starts a page transition; the bar animates `transition` to 1.
         island->previous_service = island->service;
         island->previous_scroll_offset = island->scroll_offset;
-        island->service = i;
+        island->service = service;
         island->scroll_offset = 0;
         island->scroll_target = 0;
         island->transition = 0;
@@ -2266,6 +2517,11 @@ bool island_handle_click(struct island* island,
 
   if (island->service == ISLAND_SERVICE_SCREENS
       && island_handle_screens_click(&layout, point, action)) {
+    return true;
+  }
+
+  if (island->service == ISLAND_SERVICE_APPS
+      && island_handle_apps_click(island, &layout, point, action)) {
     return true;
   }
 
@@ -2350,6 +2606,7 @@ static CGFloat island_text_width(const char* text, CTFontRef font) {
 }
 
 CGFloat island_peek_text(const struct notification_item* item,
+                         int max_chars,
                          char* out,
                          size_t size                          ) {
   char full[512];
@@ -2359,8 +2616,8 @@ CGFloat island_peek_text(const struct notification_item* item,
     snprintf(full, sizeof(full), "%s", item->title[0] ? item->title
                                                       : item->body );
 
-  // At most ISLAND_PEEK_CHARS characters (whole ones: emoji, accents), then
-  // "...".
+  // At most `max_chars` characters (whole ones: emoji, accents), then "...".
+  if (max_chars <= 0) max_chars = ISLAND_PEEK_CHARS;
   snprintf(out, size, "%s", full);
   CFStringRef string = CFStringCreateWithCString(NULL, full,
                                                  kCFStringEncodingUTF8);
@@ -2368,7 +2625,7 @@ CGFloat island_peek_text(const struct notification_item* item,
     CFIndex length = CFStringGetLength(string);
     CFIndex end = 0;
     int characters = 0;
-    while (end < length && characters < ISLAND_PEEK_CHARS) {
+    while (end < length && characters < max_chars) {
       CFRange range = CFStringGetRangeOfComposedCharactersAtIndex(string, end);
       end = range.location + range.length;
       characters++;
@@ -2409,9 +2666,17 @@ void island_draw_peek(CGContextRef context,
 }
 
 void island_clamp_scroll(struct island* island, CGRect panel) {
-  if (!g_loaded || island->service != ISLAND_SERVICE_ALERTS) return;
+  if (!g_loaded) return;
   struct island_layout layout = island_get_layout(panel);
-  CGFloat max_scroll = island_max_scroll(&layout);
+  CGFloat max_scroll;
+  if (island->service == ISLAND_SERVICE_ALERTS) {
+    max_scroll = island_max_scroll(&layout);
+  } else if (island->service == ISLAND_SERVICE_APPS) {
+    struct island_apps_layout a = island_get_apps_layout(&layout);
+    max_scroll = island_apps_max_scroll(&a);
+  } else {
+    return;
+  }
   island->scroll_target = max(min(island->scroll_target, max_scroll), 0);
   island->scroll_offset = max(min(island->scroll_offset, max_scroll), 0);
 }
@@ -2422,7 +2687,7 @@ bool island_handle_scroll(struct island* island,
                           CGFloat delta          ) {
   if (!g_loaded || !CGRectContainsPoint(panel, point)) return false;
 
-  // The Alerts and Bluetooth lists scroll the same way: this only moves the
+  // The Alerts, Bluetooth and Apps lists scroll the same way: this only moves the
   // target, the bar glides (wheel) or follows (trackpad) towards it.
   struct island_layout layout = island_get_layout(panel);
   CGFloat max_scroll;
@@ -2431,6 +2696,9 @@ bool island_handle_scroll(struct island* island,
   } else if (island->service == ISLAND_SERVICE_BLUETOOTH) {
     struct island_bluetooth_layout b = island_get_bluetooth_layout(&layout);
     max_scroll = island_bluetooth_max_scroll(connections_get(), &b);
+  } else if (island->service == ISLAND_SERVICE_APPS) {
+    struct island_apps_layout a = island_get_apps_layout(&layout);
+    max_scroll = island_apps_max_scroll(&a);
   } else {
     return true;
   }

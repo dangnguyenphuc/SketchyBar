@@ -18,7 +18,8 @@
 #define BAR_TOGGLE_PENDING        5.0
 
 // Peek timing: grows in BAR_PEEK_DURATION frames (60Hz), holds for
-// BAR_PEEK_HOLD seconds, shrinks in BAR_PEEK_DURATION frames: 3s in total.
+// notification_peek_duration seconds (default BAR_PEEK_HOLD; 0: no peek),
+// shrinks in BAR_PEEK_DURATION frames: 3s in total by default.
 // Layout: padding around the app icon and the text beside the camera.
 // Alerts card animations are driven for at most this many frames (60Hz).
 #define BAR_CARDS_FRAMES          40
@@ -49,8 +50,9 @@
 // Slide between service pages (60Hz frames, ease-out).
 #define BAR_PAGE_DURATION         22
 
-// An open island closes after this many seconds without a click, scroll or
-// hover. It never closes while the pointer is over it.
+// An open island closes after island_idle_timeout seconds (default below;
+// 0: never) without a click, scroll or hover. It never closes while the
+// pointer is over it.
 #define BAR_ISLAND_IDLE_TIMEOUT   60.0
 
 // CPU/RAM are sampled every BAR_STATS_INTERVAL seconds from startup on, open
@@ -118,5 +120,7 @@ bool bar_island_scroll(struct bar* bar,
                        bool continuous);
 bool bar_contains_point(struct bar* bar, CGPoint point);
 void bar_island_touch(struct bar* bar);
+// An island setting changed (sketchybarrc): applies it to open islands.
+void bar_island_settings_changed(void);
 
 void bar_change_space(struct bar* bar, uint64_t dsid);

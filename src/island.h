@@ -22,8 +22,19 @@ enum island_service {
   ISLAND_SERVICE_SYSTEM,
   ISLAND_SERVICE_BLUETOOTH,
   ISLAND_SERVICE_SCREENS,
+  ISLAND_SERVICE_APPS,
   ISLAND_SERVICE_COUNT
 };
+
+// Which services the column shows, top to bottom (sketchybarrc:
+// --bar island_tabs=alerts,music,system,bluetooth,apps). Names: alerts,
+// music, system, bluetooth, screens, apps; each at most once. The column
+// spreads its icons evenly over its height, however many there are.
+#define ISLAND_TABS_DEFAULT "alerts,music,system,bluetooth,apps"
+
+// Sets the tabs from a comma separated list. False (nothing changed, `error`
+// says why) for an unknown name or an empty list.
+bool island_set_tabs(const char* list, char* error, size_t size);
 
 // A card of the Alerts tab as drawn: the notification (a copy, so it can
 // still be drawn while leaving), its animated position (points from the top
@@ -65,6 +76,11 @@ struct island {
   // false: not synced yet, jump instead of animating.
   double toggle_progress[2];
   bool toggles_ready;
+
+  // Apps tab: the switch last clicked (by app name) slides over while
+  // `app_toggle_progress` goes 0 -> 1, animated by the bar.
+  char app_toggle[64];
+  double app_toggle_progress;
 
   // Alerts tab cards (see island_sync_cards). `cards_synced` false: the next
   // sync places them without animating (just opened).
@@ -120,7 +136,8 @@ enum island_action_type {
   ISLAND_ACTION_SET_BRIGHTNESS,
   ISLAND_ACTION_NOTIFICATION_OPEN,
   ISLAND_ACTION_NOTIFICATION_DISMISS,
-  ISLAND_ACTION_NOTIFICATIONS_READ_ALL
+  ISLAND_ACTION_NOTIFICATIONS_READ_ALL,
+  ISLAND_ACTION_APP_TOGGLE
 };
 
 struct island_action {
@@ -128,7 +145,8 @@ struct island_action {
   float value;   // SET_VOLUME / SET_BRIGHTNESS: 0..1
   int index;     // BLUETOOTH_SELECT: index into the device list;
                  // SCREEN_SELECT: the desktop; NOTIFICATION_OPEN/DISMISS:
-                 // index into the captured notifications
+                 // index into the captured notifications; APP_TOGGLE: index
+                 // into notifications_apps()
 };
 
 // `family` is the text font family (the bar's default font); NULL uses the
@@ -158,11 +176,12 @@ void island_draw_band(struct island* island,
 
 // Peek: the newest notification shown in the closed island (collapsed
 // height, widened beside the camera: app icon left, text right).
-// island_peek_text builds the text ("Title: body", at most ISLAND_PEEK_CHARS
+// island_peek_text builds the text ("Title: body", at most `max_chars`
 // characters, then "...") into `out` and returns its width in the peek font.
 // Both need the fonts, i.e. island_open().
 #define ISLAND_PEEK_CHARS 50
 CGFloat island_peek_text(const struct notification_item* item,
+                         int max_chars,
                          char* out,
                          size_t size                          );
 void island_draw_peek(CGContextRef context,

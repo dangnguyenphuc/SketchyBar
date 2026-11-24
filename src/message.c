@@ -377,6 +377,34 @@ static bool handle_domain_bar(FILE *rsp, struct token domain, char *message) {
             &g_bar_manager,
             g_bar_manager.notch_display_height,
             token_to_int(token)         );
+  } else if (token_equals(command, PROPERTY_ISLAND_TABS)) {
+    struct token token = get_token(&message);
+    char* list = token_to_string(token);
+    char error[160] = "";
+    if (list && island_set_tabs(list, error, sizeof(error))) {
+      bar_island_settings_changed();
+      needs_refresh = true;
+    } else {
+      respond(rsp, "[!] Bar: Invalid island_tabs: %s\n", error);
+    }
+    free(list);
+  } else if (token_equals(command, PROPERTY_ISLAND_IDLE_TIMEOUT)) {
+    struct token token = get_token(&message);
+    g_bar_manager.island_idle_timeout = max(token_to_float(token), 0);
+    bar_island_settings_changed();
+  } else if (token_equals(command, PROPERTY_NOTIFICATION_SCAN_INTERVAL)) {
+    struct token token = get_token(&message);
+    notifications_set_scan_interval(token_to_float(token));
+  } else if (token_equals(command, PROPERTY_NOTIFICATION_PEEK_DURATION)) {
+    struct token token = get_token(&message);
+    g_bar_manager.notification_peek_hold = max(token_to_float(token), 0);
+  } else if (token_equals(command, PROPERTY_NOTIFICATION_PEEK_CHARS)) {
+    struct token token = get_token(&message);
+    g_bar_manager.notification_peek_chars = max(min(token_to_int(token),
+                                                    200             ), 1);
+  } else if (token_equals(command, PROPERTY_NOTIFICATION_PER_APP)) {
+    struct token token = get_token(&message);
+    notifications_set_per_app(token_to_int(token));
   } else if (token_equals(command, PROPERTY_HIDDEN)) {
     struct token state = get_token(&message);
     uint32_t adid = 0;

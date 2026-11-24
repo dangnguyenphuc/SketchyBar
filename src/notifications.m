@@ -21,6 +21,10 @@
 // A banner and a stored notification with the same app and texts within
 // this many seconds are the same notification.
 #define SAME_WINDOW            300.0
+// The apps that may send notifications (System Settings > Notifications).
+#define NCPREFS_PATH "~/Library/Preferences/com.apple.ncprefs.plist"
+
+extern char g_config_file[4096];
 
 static struct notification_list g_list;
 static notifications_callback* g_callback = NULL;
@@ -37,6 +41,21 @@ static NSMutableOrderedSet* g_read = nil;  // opened / read all
 static AXUIElementRef g_center = NULL;
 static pid_t g_center_pid = 0;
 static dispatch_source_t g_timer = NULL;
+
+static double g_scan_interval = NOTIFICATIONS_SCAN_DEFAULT;
+static int g_per_app = NOTIFICATIONS_PER_APP_DEFAULT;
+
+// Apps: from ncprefs (re-read when it changed) and seen in notifications;
+// the ones switched off (loaded from the apps file once the config directory
+// is known, re-read when it changed).
+static struct notification_apps g_apps;
+static NSMutableSet* g_ncprefs_apps = nil;
+static NSMutableSet* g_seen_apps = nil;
+static NSMutableDictionary* g_ncprefs_names = nil;  // bundle -> name / NSNull
+static struct timespec g_ncprefs_stamp;
+static NSMutableSet* g_disabled = nil;
+static bool g_disabled_loaded = false;
+static struct timespec g_disabled_stamp;
 
 static dispatch_queue_t g_database_queue = NULL;
 static bool g_database_reading = false;
@@ -57,6 +76,158 @@ static void remember(NSMutableOrderedSet* set, NSString* identifier) {
   while (set.count > REMEMBER_MAX) [set removeObjectAtIndex:0];
 }
 
+static struct timespec file_stamp(NSString* path) {
+  struct stat info;
+  struct timespec stamp = { 0, 0 };
+  if (path && stat([path fileSystemRepresentation], &info) == 0)
+    stamp = info.st_mtimespec;
+  return stamp;
+}
+
+static bool same_stamp(struct timespec a, struct timespec b) {
+  return a.tv_sec == b.tv_sec && a.tv_nsec == b.tv_nsec;
+}
+
+// "/Applications/Zalo.app" -> "Zalo", as Finder (and banners) name it.
+static NSString* display_name(NSString* path) {
+  NSString* name = [[NSFileManager defaultManager] displayNameAtPath:path];
+  if ([name hasSuffix:@".app"]) name = [name stringByDeletingPathExtension];
+  return name;
+}
+
+// ------------------------------------------------------------ apps
+
+static bool app_disabled(const char* app) {
+  if (!g_disabled || !app[0]) return false;
+  return [g_disabled containsObject:@(app)];
+}
+
+// The apps file: next to the config file. nil until that is known (the
+// config runs after capturing started).
+static NSString* apps_file_path() {
+  NSString* directory = nil;
+  if (g_config_file[0]) {
+    directory = [@(g_config_file) stringByDeletingLastPathComponent];
+  } else {
+    const char* config_dir = getenv("CONFIG_DIR");
+    if (config_dir && config_dir[0]) directory = @(config_dir);
+  }
+  return [directory stringByAppendingPathComponent:@NOTIFICATIONS_APPS_FILE];
+}
+
+// Reads the apps switched off (again when the file changed, e.g. edited by
+// hand). Returns whether that changed anything.
+static bool load_disabled() {
+  NSString* path = apps_file_path();
+  if (!path) return false;
+  struct timespec stamp = file_stamp(path);
+  if (g_disabled_loaded && same_stamp(stamp, g_disabled_stamp)) return false;
+  g_disabled_loaded = true;
+  g_disabled_stamp = stamp;
+
+  NSMutableSet* disabled = [NSMutableSet set];
+  NSString* text = [NSString stringWithContentsOfFile:path
+                                             encoding:NSUTF8StringEncoding
+                                                error:NULL                 ];
+  for (NSString* line in [text componentsSeparatedByCharactersInSet:
+                            [NSCharacterSet newlineCharacterSet]]) {
+    NSString* name = [line stringByTrimmingCharactersInSet:
+                        [NSCharacterSet whitespaceCharacterSet]];
+    if (name.length > 0 && ![name hasPrefix:@"#"]) [disabled addObject:name];
+  }
+  if ([disabled isEqualToSet:g_disabled]) return false;
+  [g_disabled setSet:disabled];
+  return true;
+}
+
+static void save_disabled() {
+  NSString* path = apps_file_path();
+  if (!path) return;
+  NSMutableString* text = [NSMutableString stringWithString:
+    @"# Apps whose notifications SketchyBar doesn't capture, one per line.\n"
+     "# Written by the island's Apps tab; can be edited by hand.\n"];
+  NSArray* names = [[g_disabled allObjects]
+    sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+  for (NSString* name in names) [text appendFormat:@"%@\n", name];
+  [text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding
+              error:NULL                                             ];
+  g_disabled_stamp = file_stamp(path);
+}
+
+// The app behind an ncprefs entry, by its name. nil for what can't be picked
+// as an app (system services, helpers inside another app).
+static NSString* ncprefs_app_name(NSDictionary* entry) {
+  NSString* bundle = entry[@"bundle-id"];
+  if (![bundle isKindOfClass:[NSString class]] || bundle.length == 0
+      || [bundle hasPrefix:@"_"]) {
+    return nil;
+  }
+  id cached = g_ncprefs_names[bundle];
+  if (cached) return cached == [NSNull null] ? nil : cached;
+
+  NSString* path = [entry[@"path"] isKindOfClass:[NSString class]]
+                   ? entry[@"path"] : nil;
+  // Notification bundles of system apps (Calendar, Reminders, ...): the app.
+  if (![path hasSuffix:@".app"]) {
+    path = [[NSWorkspace sharedWorkspace]
+             URLForApplicationWithBundleIdentifier:bundle].path;
+  }
+  NSString* name = nil;
+  if ([path hasSuffix:@".app"] && ![path containsString:@".app/"])
+    name = display_name(path);
+  g_ncprefs_names[bundle] = name.length > 0 ? name : [NSNull null];
+  return name.length > 0 ? name : nil;
+}
+
+// Re-reads ncprefs when it changed. Returns whether the apps changed.
+static bool load_ncprefs() {
+  NSString* path = [@NCPREFS_PATH stringByExpandingTildeInPath];
+  struct timespec stamp = file_stamp(path);
+  if (same_stamp(stamp, g_ncprefs_stamp) && g_ncprefs_apps.count > 0)
+    return false;
+  g_ncprefs_stamp = stamp;
+
+  NSMutableSet* apps = [NSMutableSet set];
+  NSDictionary* prefs = [NSDictionary dictionaryWithContentsOfFile:path];
+  NSArray* entries = [prefs isKindOfClass:[NSDictionary class]]
+                     ? prefs[@"apps"] : nil;
+  if ([entries isKindOfClass:[NSArray class]]) {
+    for (NSDictionary* entry in entries) {
+      if (![entry isKindOfClass:[NSDictionary class]]) continue;
+      NSString* name = ncprefs_app_name(entry);
+      if (name) [apps addObject:name];
+    }
+  }
+  if ([apps isEqualToSet:g_ncprefs_apps]) return false;
+  [g_ncprefs_apps setSet:apps];
+  return true;
+}
+
+static void see_app(const char* app) {
+  if (app[0]) [g_seen_apps addObject:@(app)];
+}
+
+// Rebuilds g_apps (sorted, with the switches). Returns whether it changed.
+static bool refresh_apps() {
+  struct notification_apps apps;
+  memset(&apps, 0, sizeof(apps));
+  @autoreleasepool {
+    NSMutableSet* all = [NSMutableSet setWithSet:g_ncprefs_apps];
+    [all unionSet:g_seen_apps];
+    NSArray* names = [[all allObjects]
+      sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+    for (NSString* name in names) {
+      if (apps.count >= NOTIFICATIONS_APPS_MAX) break;
+      struct notification_app* app = &apps.items[apps.count++];
+      copy_string(app->name, sizeof(app->name), name);
+      app->enabled = ![g_disabled containsObject:name];
+    }
+  }
+  if (memcmp(&apps, &g_apps, sizeof(apps)) == 0) return false;
+  g_apps = apps;
+  return true;
+}
+
 // ------------------------------------------------------------ the list
 
 static int compare_newest(const void* a, const void* b) {
@@ -75,19 +246,23 @@ static bool same_notification(const struct notification_item* a,
 }
 
 // The unread list: stored notifications plus banners that aren't stored,
-// minus what was marked read; newest first, at most NOTIFICATIONS_PER_APP
-// per app and NOTIFICATIONS_MAX in all.
+// minus what was marked read and apps switched off; newest first, at most
+// g_per_app per app and NOTIFICATIONS_MAX in all. Also notifies when the apps
+// changed.
 static void rebuild() {
+  bool apps_changed = refresh_apps();
   static struct notification_item all[DATABASE_ROWS + NOTIFICATIONS_MAX];
   int count = 0;
 
   @autoreleasepool {
     for (int i = 0; i < g_stored_count; i++) {
+      if (app_disabled(g_stored[i].app)) continue;
       if ([g_read containsObject:@(g_stored[i].id)]) continue;
       all[count++] = g_stored[i];
     }
     int stored = count;
     for (int i = 0; i < g_banner_count; i++) {
+      if (app_disabled(g_banners[i].app)) continue;
       if ([g_read containsObject:@(g_banners[i].id)]) continue;
       bool duplicate = false;
       for (int j = 0; j < stored && !duplicate; j++)
@@ -106,11 +281,14 @@ static void rebuild() {
     for (int j = 0; j < list.count; j++) {
       if (strcmp(list.items[j].app, all[i].app) == 0) same++;
     }
-    if (same >= NOTIFICATIONS_PER_APP) continue;
+    if (same >= g_per_app) continue;
     list.items[list.count++] = all[i];
   }
 
-  if (memcmp(&list, &g_list, sizeof(list)) == 0) return;
+  if (memcmp(&list, &g_list, sizeof(list)) == 0) {
+    if (apps_changed) notify();
+    return;
+  }
   g_list = list;
   notify();
 }
@@ -218,8 +396,12 @@ static void scan_banners() {
     if (added.count == 0) return;
 
     // Listed newest first: insert from the oldest so the newest ends first.
+    // Apps switched off aren't captured (they stay seen, so switching one on
+    // again doesn't bring them back).
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     for (NSDictionary* entry in [added reverseObjectEnumerator]) {
+      see_app([entry[@"app"] UTF8String]);
+      if (app_disabled([entry[@"app"] UTF8String])) continue;
       int keep = min(g_banner_count, NOTIFICATIONS_MAX - 1);
       memmove(&g_banners[1], &g_banners[0],
               keep * sizeof(struct notification_item));
@@ -249,10 +431,7 @@ static NSString* app_name(NSString* bundle) {
 
   NSURL* url = [[NSWorkspace sharedWorkspace]
                  URLForApplicationWithBundleIdentifier:bundle];
-  if (url) {
-    name = [[[NSFileManager defaultManager] displayNameAtPath:url.path]
-             stringByDeletingPathExtension];
-  }
+  if (url) name = display_name(url.path);
   if (name.length == 0) {
     name = [[bundle componentsSeparatedByString:@"."] lastObject];
     if (name.length > 0) {
@@ -391,6 +570,7 @@ static void scan_database() {
       } else {
         memcpy(g_stored, rows, count * sizeof(struct notification_item));
         g_stored_count = count;
+        for (int i = 0; i < count; i++) see_app(g_stored[i].app);
       }
       if (access && !g_list.history) database_changed();  // take the stamps
       g_list.history = access;
@@ -427,9 +607,14 @@ static void attach() {
   g_center = AXUIElementCreateApplication(g_center_pid);
 }
 
-// Every NOTIFICATIONS_SCAN seconds: banners on screen (Accessibility), and
-// Notification Center's database if it changed.
+// Every scan interval: banners on screen (Accessibility), Notification
+// Center's database if it changed, and the apps (ncprefs, apps file) if they
+// changed.
 static void tick() {
+  bool apps = load_ncprefs();
+  if (load_disabled()) apps = true;
+  if (apps) rebuild();
+
   bool trusted = AXIsProcessTrusted();
   if (trusted != g_list.trusted) {
     g_list.trusted = trusted;
@@ -445,12 +630,25 @@ static void tick() {
 
 // ------------------------------------------------------------ public
 
+static void schedule_timer() {
+  if (!g_timer) return;
+  uint64_t interval = g_scan_interval * NSEC_PER_SEC;
+  dispatch_source_set_timer(g_timer,
+                            dispatch_time(DISPATCH_TIME_NOW, interval),
+                            interval,
+                            interval / 4                               );
+}
+
 void notifications_begin(notifications_callback* on_change) {
   if (g_seen) return;
   g_callback = on_change;
   g_seen = [[NSMutableOrderedSet alloc] init];
   g_read = [[NSMutableOrderedSet alloc] init];
   g_app_names = [[NSMutableDictionary alloc] init];
+  g_ncprefs_apps = [[NSMutableSet alloc] init];
+  g_seen_apps = [[NSMutableSet alloc] init];
+  g_ncprefs_names = [[NSMutableDictionary alloc] init];
+  g_disabled = [[NSMutableSet alloc] init];
   g_database_queue = dispatch_queue_create("sketchybar.notifications",
                                            DISPATCH_QUEUE_SERIAL      );
 
@@ -460,14 +658,12 @@ void notifications_begin(notifications_callback* on_change) {
 
   g_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                                    dispatch_get_main_queue()       );
-  dispatch_source_set_timer(g_timer,
-                            dispatch_time(DISPATCH_TIME_NOW,
-                                          NOTIFICATIONS_SCAN * NSEC_PER_SEC),
-                            NOTIFICATIONS_SCAN * NSEC_PER_SEC,
-                            0.5 * NSEC_PER_SEC                              );
-  dispatch_source_set_event_handler(g_timer, ^{ tick(); });
+  schedule_timer();
+  dispatch_source_set_event_handler(g_timer, ^{ @autoreleasepool { tick(); } });
   dispatch_resume(g_timer);
-  tick();
+  // The first scan runs once the caller is done: it reports the apps right
+  // away, and the callback must not run while the bar is still being built.
+  dispatch_async(dispatch_get_main_queue(), ^{ @autoreleasepool { tick(); } });
 }
 
 const struct notification_list* notifications_get(void) {
@@ -526,7 +722,7 @@ void notifications_dismiss(int index) {
 }
 
 // Everything known, not just what the list shows (it keeps
-// NOTIFICATIONS_PER_APP per app): older ones mustn't move up.
+// g_per_app per app): older ones mustn't move up.
 void notifications_read_all(void) {
   if (g_list.count == 0) return;
   @autoreleasepool {
@@ -536,4 +732,43 @@ void notifications_read_all(void) {
       remember(g_read, @(g_banners[i].id));
   }
   rebuild();
+}
+
+const struct notification_apps* notifications_apps(void) {
+  return &g_apps;
+}
+
+void notifications_set_app_enabled(int index, bool enabled) {
+  if (index < 0 || index >= g_apps.count) return;
+  if (g_apps.items[index].enabled == enabled) return;
+  @autoreleasepool {
+    load_disabled();
+    NSString* name = @(g_apps.items[index].name);
+    if (enabled) [g_disabled removeObject:name];
+    else [g_disabled addObject:name];
+    save_disabled();
+  }
+  rebuild();
+}
+
+void notifications_set_scan_interval(double seconds) {
+  seconds = max(min(seconds, NOTIFICATIONS_SCAN_MAX), NOTIFICATIONS_SCAN_MIN);
+  if (seconds == g_scan_interval) return;
+  g_scan_interval = seconds;
+  schedule_timer();
+}
+
+double notifications_scan_interval(void) {
+  return g_scan_interval;
+}
+
+void notifications_set_per_app(int count) {
+  count = max(min(count, NOTIFICATIONS_MAX), 1);
+  if (count == g_per_app) return;
+  g_per_app = count;
+  if (g_seen) rebuild();
+}
+
+int notifications_per_app(void) {
+  return g_per_app;
 }

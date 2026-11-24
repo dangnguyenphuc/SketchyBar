@@ -38,6 +38,12 @@ struct bar_manager {
   uint32_t notch_offset;
   uint32_t notch_display_height;
   uint32_t active_adid;
+
+  // Island settings (--bar island_idle_timeout, notification_peek_duration,
+  // notification_peek_chars), see bar.h.
+  double island_idle_timeout;
+  double notification_peek_hold;
+  int notification_peek_chars;
   uint32_t window_level;
 
   struct bar** bars;

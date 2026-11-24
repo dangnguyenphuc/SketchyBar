@@ -118,6 +118,12 @@
 #define PROPERTY_NOTCH_WIDTH                   "notch_width"
 #define PROPERTY_NOTCH_OFFSET                  "notch_offset"
 #define PROPERTY_NOTCH_DISPLAY_HEIGHT          "notch_display_height"
+#define PROPERTY_ISLAND_TABS                   "island_tabs"
+#define PROPERTY_ISLAND_IDLE_TIMEOUT           "island_idle_timeout"
+#define PROPERTY_NOTIFICATION_SCAN_INTERVAL    "notification_scan_interval"
+#define PROPERTY_NOTIFICATION_PEEK_DURATION    "notification_peek_duration"
+#define PROPERTY_NOTIFICATION_PEEK_CHARS       "notification_peek_chars"
+#define PROPERTY_NOTIFICATION_PER_APP          "notification_per_app"
 #define PROPERTY_HORIZONTAL                    "horizontal"
 
 #define DOMAIN_SUBSCRIBE                       "--subscribe"

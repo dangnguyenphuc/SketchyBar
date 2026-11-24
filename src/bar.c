@@ -288,6 +288,7 @@ static void bar_island_update_brightness(struct bar* bar);
 static void bar_click_toggle(struct bar* bar, int column);
 static void bar_sync_toggles(struct bar* bar);
 static void bar_island_connections_changed(void);
+static void bar_animate_app_toggle(struct bar* bar);
 
 // Opens a System Settings page (an x-apple.systempreferences: URL).
 static void bar_open_url(const char* string) {
@@ -360,6 +361,18 @@ static void bar_island_perform(struct bar* bar, struct island_action* action) {
       notifications_read_all();
       island_clamp_scroll(&bar->island, bar_get_island_panel(bar));
       break;
+    case ISLAND_ACTION_APP_TOGGLE: {
+      const struct notification_apps* apps = notifications_apps();
+      if (action->index < 0 || action->index >= apps->count) break;
+      // Starts the slide before the change redraws the island.
+      snprintf(bar->island.app_toggle, sizeof(bar->island.app_toggle), "%s",
+               apps->items[action->index].name                            );
+      bar->island.app_toggle_progress = 0;
+      notifications_set_app_enabled(action->index,
+                                    !apps->items[action->index].enabled);
+      bar_animate_app_toggle(bar);
+      break;
+    }
     case ISLAND_ACTION_SET_BRIGHTNESS:
       if (bar->has_brightness) {
         DisplayServicesSetBrightness(bar->did, action->value);
@@ -500,6 +513,34 @@ static void bar_animate_island_transition(struct bar* bar) {
   g_bar_manager.animator.interp_function = INTERP_FUNCTION_SIN;
 
   ANIMATE(bar_set_island_transition, bar, 0, BAR_EXPAND_PROGRESS_MAX);
+  animator_lock(&g_bar_manager.animator);
+
+  g_bar_manager.animator.duration = saved_duration;
+  g_bar_manager.animator.interp_function = saved_interp;
+  (void)needs_refresh;
+}
+
+// Apps tab: the clicked app's switch slides (island.app_toggle_progress).
+static bool bar_set_app_toggle(void* target, int value) {
+  struct bar* bar = target;
+  double progress = (double)value / BAR_EXPAND_PROGRESS_MAX;
+  if (bar->island.app_toggle_progress == progress) return false;
+  bar->island.app_toggle_progress = progress;
+  return true;
+}
+
+static void bar_animate_app_toggle(struct bar* bar) {
+  animator_cancel_locked(&g_bar_manager.animator,
+                         bar,
+                         (animator_function*)bar_set_app_toggle);
+
+  bool needs_refresh = false;
+  uint32_t saved_duration = g_bar_manager.animator.duration;
+  char saved_interp = g_bar_manager.animator.interp_function;
+  g_bar_manager.animator.duration = BAR_TOGGLE_DURATION;
+  g_bar_manager.animator.interp_function = INTERP_FUNCTION_SIN;
+
+  ANIMATE(bar_set_app_toggle, bar, 0, BAR_EXPAND_PROGRESS_MAX);
   animator_lock(&g_bar_manager.animator);
 
   g_bar_manager.animator.duration = saved_duration;
@@ -1103,10 +1144,11 @@ static void bar_island_idle_handler(CFRunLoopTimerRef timer, void* context);
 
 static void bar_island_schedule_idle() {
   CFAbsoluteTime next = 0;
-  for (int i = 0; i < g_bar_manager.bar_count; i++) {
+  double timeout = g_bar_manager.island_idle_timeout;
+  for (int i = 0; i < g_bar_manager.bar_count && timeout > 0; i++) {
     struct bar* bar = g_bar_manager.bars[i];
     if (!bar || !bar->expanded) continue;
-    CFAbsoluteTime deadline = bar->island_activity + BAR_ISLAND_IDLE_TIMEOUT;
+    CFAbsoluteTime deadline = bar->island_activity + timeout;
     if (!next || deadline < next) next = deadline;
   }
 
@@ -1128,13 +1170,14 @@ static void bar_island_schedule_idle() {
 
 static void bar_island_idle_handler(CFRunLoopTimerRef timer, void* context) {
   CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-  for (int i = 0; i < g_bar_manager.bar_count; i++) {
+  double timeout = g_bar_manager.island_idle_timeout;
+  for (int i = 0; i < g_bar_manager.bar_count && timeout > 0; i++) {
     struct bar* bar = g_bar_manager.bars[i];
     if (!bar || !bar->expanded) continue;
 
     // Hovering counts as interaction for as long as it lasts.
     if (bar->mouse_over) bar->island_activity = now;
-    else if (now - bar->island_activity >= BAR_ISLAND_IDLE_TIMEOUT - 0.05)
+    else if (now - bar->island_activity >= timeout - 0.05)
       bar_toggle_expanded(bar);
   }
   bar_island_schedule_idle();
@@ -1145,6 +1188,16 @@ void bar_island_touch(struct bar* bar) {
   if (!bar->expanded) return;
   bar->island_activity = CFAbsoluteTimeGetCurrent();
   bar_island_schedule_idle();
+}
+
+void bar_island_settings_changed(void) {
+  bar_island_schedule_idle();
+  for (int i = 0; i < g_bar_manager.bar_count; i++) {
+    struct bar* bar = g_bar_manager.bars[i];
+    if (bar && bar->expanded)
+      island_clamp_scroll(&bar->island, bar_get_island_panel(bar));
+  }
+  g_bar_manager.bar_needs_update = true;
 }
 
 static bool bar_any_expanded() {
@@ -1257,13 +1310,13 @@ static void bar_stop_peek(struct bar* bar) {
 }
 
 // Shows `item` in the closed island: grow (BAR_PEEK_DURATION), hold
-// (BAR_PEEK_HOLD), shrink (BAR_PEEK_DURATION). A newer one during a peek
-// replaces it and starts the hold again.
+// (notification_peek_duration), shrink (BAR_PEEK_DURATION). A newer one
+// during a peek replaces it and starts the hold again.
 static void bar_peek(struct bar* bar, const struct notification_item* item) {
   island_open(&bar->island, g_bar_manager.default_item.label.font.family);
   bar->peek_item = *item;
-  CGFloat text = island_peek_text(item, bar->peek_text,
-                                  sizeof(bar->peek_text));
+  CGFloat text = island_peek_text(item, g_bar_manager.notification_peek_chars,
+                                  bar->peek_text, sizeof(bar->peek_text)    );
 
   // How far past the collapsed shape each side has to reach: the icon left
   // of the camera, the text right of it (clear of the rounded corner).
@@ -1281,7 +1334,8 @@ static void bar_peek(struct bar* bar, const struct notification_item* item) {
   if (bar->peek_progress < BAR_EXPAND_PROGRESS_MAX) bar_animate_peek(bar);
 
   uint64_t token = ++bar->peek_token;
-  double hold = BAR_PEEK_DURATION / 60.0 + BAR_PEEK_HOLD;
+  double hold = BAR_PEEK_DURATION / 60.0
+                + g_bar_manager.notification_peek_hold;
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, hold * NSEC_PER_SEC),
                  dispatch_get_main_queue(),
                  ^{
@@ -1318,7 +1372,8 @@ static void bar_island_notifications_changed(void) {
       if (island_sync_cards(&bar->island, visible))
         bar_animate_island_cards(bar);
       island_clamp_scroll(&bar->island, bar_get_island_panel(bar));
-    } else if (arrived && bar_is_horizontal() && bar->shown && !bar->hidden
+    } else if (arrived && g_bar_manager.notification_peek_hold > 0
+               && bar_is_horizontal() && bar->shown && !bar->hidden
                && bar->adid == g_bar_manager.active_adid               ) {
       bar_peek(bar, &list->items[0]);
     }

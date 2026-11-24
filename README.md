@@ -68,6 +68,11 @@ for some further tips on your journey. If you are searching for functional items
 Should you encounter things not working as you expect them to, please *do not* hesitate to open an [issue](https://github.com/FelixKratz/SketchyBar/issues), as
 this is either a bug or a documentation problem and relevant in any case.
 
+## Notch Island (this fork)
+This fork turns the bar into a notch island that expands into tabs: notifications, music,
+system info, Bluetooth and per-app notification capture. For every island setting with its default,
+the tabs, required permissions and troubleshooting, see the **[Notch Island Cheat Sheet](CHEATSHEET.md)**.
+
 ## Documentation
 For the full documentation of all commands and properties please refer to the [website](https://felixkratz.github.io/SketchyBar/config/bar).
 
