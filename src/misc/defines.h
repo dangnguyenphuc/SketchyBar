@@ -32,6 +32,7 @@
 
 #define DOMAIN_HOTLOAD                         "--hotload"
 #define DOMAIN_RELOAD                          "--reload"
+#define DOMAIN_CLAUDE                          "--claude"
 #define DOMAIN_ADD_FONT                        "--load-font"
 
 #define SUB_DOMAIN_ICON                        "icon"
@@ -124,6 +125,11 @@
 #define PROPERTY_NOTIFICATION_PEEK_DURATION    "notification_peek_duration"
 #define PROPERTY_NOTIFICATION_PEEK_CHARS       "notification_peek_chars"
 #define PROPERTY_NOTIFICATION_PER_APP          "notification_per_app"
+#define PROPERTY_CLAUDE_CHECK_URL              "claude_check_url"
+#define PROPERTY_CLAUDE_CHECK_COMMAND          "claude_check_command"
+#define PROPERTY_CLAUDE_CHECK_INTERVAL         "claude_check_interval"
+#define PROPERTY_CLAUDE_MODELS_SCRIPT          "claude_models_script"
+#define PROPERTY_CLAUDE_MODELS_FILE            "claude_models_file"
 #define PROPERTY_HORIZONTAL                    "horizontal"
 
 #define DOMAIN_SUBSCRIBE                       "--subscribe"

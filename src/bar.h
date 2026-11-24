@@ -25,7 +25,7 @@
 #define BAR_CARDS_FRAMES          40
 
 #define BAR_PEEK_DURATION         15
-#define BAR_PEEK_HOLD             2.5
+#define BAR_PEEK_HOLD             3
 #define BAR_PEEK_PADDING          10
 #define BAR_PEEK_ICON             22
 // Only notifications at most this many seconds old peek.

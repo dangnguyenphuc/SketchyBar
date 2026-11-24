@@ -289,6 +289,7 @@ static void bar_click_toggle(struct bar* bar, int column);
 static void bar_sync_toggles(struct bar* bar);
 static void bar_island_connections_changed(void);
 static void bar_animate_app_toggle(struct bar* bar);
+static void bar_animate_claude_transition(struct bar* bar);
 
 // Opens a System Settings page (an x-apple.systempreferences: URL).
 static void bar_open_url(const char* string) {
@@ -349,9 +350,37 @@ static void bar_island_perform(struct bar* bar, struct island_action* action) {
     case ISLAND_ACTION_SET_VOLUME:
       audio_output_set_volume(action->value);
       break;
-    case ISLAND_ACTION_NOTIFICATION_OPEN:
-      notifications_open(action->index);
+    case ISLAND_ACTION_NOTIFICATION_OPEN: {
+      // Claude's notifications open their project in VS Code (`code`; if
+      // it isn't set up, the notification is only marked read).
+      const struct notification_list* list = notifications_get();
+      if (action->index >= 0 && action->index < list->count
+          && list->items[action->index].claude              ) {
+        claude_open_path(list->items[action->index].path);
+        notifications_dismiss(action->index);
+      } else {
+        notifications_open(action->index);
+      }
       island_clamp_scroll(&bar->island, bar_get_island_panel(bar));
+      break;
+    }
+    case ISLAND_ACTION_CLAUDE_SUBTAB:
+      bar_animate_claude_transition(bar);
+      break;
+    case ISLAND_ACTION_CLAUDE_OPEN: {
+      const struct claude_state* claude = claude_get();
+      if (action->index >= 0 && action->index < claude->session_count)
+        claude_open_path(claude->sessions[action->index].cwd);
+      break;
+    }
+    case ISLAND_ACTION_CLAUDE_STOP:
+      claude_stop_session(action->index);
+      break;
+    case ISLAND_ACTION_CLAUDE_RETRY:
+      claude_check_now();
+      break;
+    case ISLAND_ACTION_CLAUDE_REFRESH:
+      claude_refresh_models();
       break;
     case ISLAND_ACTION_NOTIFICATION_DISMISS:
       notifications_dismiss(action->index);
@@ -546,6 +575,62 @@ static void bar_animate_app_toggle(struct bar* bar) {
   g_bar_manager.animator.duration = saved_duration;
   g_bar_manager.animator.interp_function = saved_interp;
   (void)needs_refresh;
+}
+
+// Claude tab: the subtab pages slide (island.claude_transition).
+static bool bar_set_claude_transition(void* target, int value) {
+  struct bar* bar = target;
+  double transition = (double)value / BAR_EXPAND_PROGRESS_MAX;
+  if (bar->island.claude_transition == transition) return false;
+  bar->island.claude_transition = transition;
+  return true;
+}
+
+static void bar_animate_claude_transition(struct bar* bar) {
+  animator_cancel_locked(&g_bar_manager.animator,
+                         bar,
+                         (animator_function*)bar_set_claude_transition);
+
+  bool needs_refresh = false;
+  uint32_t saved_duration = g_bar_manager.animator.duration;
+  char saved_interp = g_bar_manager.animator.interp_function;
+  g_bar_manager.animator.duration = BAR_PAGE_DURATION;
+  g_bar_manager.animator.interp_function = INTERP_FUNCTION_SIN;
+
+  ANIMATE(bar_set_claude_transition, bar, 0, BAR_EXPAND_PROGRESS_MAX);
+  animator_lock(&g_bar_manager.animator);
+
+  g_bar_manager.animator.duration = saved_duration;
+  g_bar_manager.animator.interp_function = saved_interp;
+  (void)needs_refresh;
+}
+
+// ------------------------------------------------------------ sprites
+// While the island draws a moving sprite (Clawd), everything is redrawn
+// ISLAND_SPRITE_FPS times a second; the timer stops on the first redraw
+// that drew none.
+static CFRunLoopTimerRef g_sprite_timer = NULL;
+
+static void bar_sprite_handler(CFRunLoopTimerRef timer, void* context) {
+  island_animation_reset();
+  g_bar_manager.bar_needs_update = true;
+  bar_manager_refresh(&g_bar_manager, false);
+  windows_unfreeze();
+  if (!island_animating()) {
+    CFRunLoopTimerInvalidate(g_sprite_timer);
+    CFRelease(g_sprite_timer);
+    g_sprite_timer = NULL;
+  }
+}
+
+static void bar_start_sprite_timer() {
+  if (g_sprite_timer) return;
+  double interval = 1.0 / ISLAND_SPRITE_FPS;
+  g_sprite_timer = CFRunLoopTimerCreate(NULL,
+                                        CFAbsoluteTimeGetCurrent() + interval,
+                                        interval, 0, 0,
+                                        bar_sprite_handler, NULL             );
+  CFRunLoopAddTimer(CFRunLoopGetMain(), g_sprite_timer, kCFRunLoopCommonModes);
 }
 
 bool bar_contains_point(struct bar* bar, CGPoint point) {
@@ -771,6 +856,7 @@ void bar_draw(struct bar* bar, bool forced) {
                        (double)bar->expand_progress
                        / BAR_EXPAND_PROGRESS_MAX     );
     }
+    if (island_animating()) bar_start_sprite_timer();
   }
 
   for (int i = 0; i < g_bar_manager.bar_item_count; i++) {
@@ -1386,9 +1472,23 @@ static void bar_island_notifications_changed(void) {
 // Started with the first bar and never stopped, see BAR_STATS_INTERVAL.
 // Notification capture starts with it: banners only show for a few seconds,
 // so it has to run while the island is closed too.
+// Claude's sessions, reachability or models changed.
+static void bar_island_claude_changed(void) {
+  for (int i = 0; i < g_bar_manager.bar_count; i++) {
+    struct bar* bar = g_bar_manager.bars[i];
+    if (bar && bar->expanded && bar->island.service == ISLAND_SERVICE_CLAUDE)
+      island_clamp_scroll(&bar->island, bar_get_island_panel(bar));
+  }
+  if (!bar_any_expanded()) return;
+  g_bar_manager.bar_needs_update = true;
+  bar_manager_refresh(&g_bar_manager, false);
+  windows_unfreeze();
+}
+
 static void bar_start_stats_history() {
   if (g_stats_timer) return;
   notifications_begin(bar_island_notifications_changed);
+  claude_set_callback(bar_island_claude_changed);
 
   // Takes the CPU baseline for the first tick.
   system_stats_sample_load(&g_island_stats);
@@ -1540,6 +1640,15 @@ static void bar_island_update_sources() {
   }
   if (connections) connections_start(bar_island_connections_changed);
   else connections_stop();
+
+  // Claude: sessions and reachability only while its tab is showing.
+  bool claude = false;
+  for (int i = 0; i < g_bar_manager.bar_count; i++) {
+    struct bar* bar = g_bar_manager.bars[i];
+    if (bar && bar->expanded && bar->island.service == ISLAND_SERVICE_CLAUDE)
+      claude = true;
+  }
+  claude_watch(claude);
 
   // CPU/RAM are already current (history timer); the battery isn't read
   // while closed, so read it now.

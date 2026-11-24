@@ -7,20 +7,20 @@
 #define NOTIFICATION_CENTER_ID @"com.apple.notificationcenterui"
 #define BANNER_SUBROLE         @"AXNotificationCenterBanner"
 // How deep to look for banners in Notification Center's windows.
-#define SCAN_DEPTH             12
+#define SCAN_DEPTH             6
 // Identifiers remembered (banners captured, notifications marked read).
-#define REMEMBER_MAX           500
+#define REMEMBER_MAX           100
 // Notification Center's database: what it currently stores.
 #ifndef DATABASE_PATH
 #define DATABASE_PATH \
   "~/Library/Group Containers/group.com.apple.usernoted/db2/db"
 #endif
-#define DATABASE_ROWS          200
+#define DATABASE_ROWS          100
 // Without access to it, look again this often (seconds).
-#define DATABASE_RETRY         30.0
+#define DATABASE_RETRY         15.0
 // A banner and a stored notification with the same app and texts within
 // this many seconds are the same notification.
-#define SAME_WINDOW            300.0
+#define SAME_WINDOW            150.0
 // The apps that may send notifications (System Settings > Notifications).
 #define NCPREFS_PATH "~/Library/Preferences/com.apple.ncprefs.plist"
 
@@ -717,6 +717,19 @@ void notifications_dismiss(int index) {
   if (index < 0 || index >= g_list.count) return;
   @autoreleasepool {
     remember(g_read, @(g_list.items[index].id));
+  }
+  rebuild();
+}
+
+void notifications_add(const struct notification_item* item) {
+  if (!g_seen) return;
+  see_app(item->app);
+  if (!app_disabled(item->app)) {
+    int keep = min(g_banner_count, NOTIFICATIONS_MAX - 1);
+    memmove(&g_banners[1], &g_banners[0],
+            keep * sizeof(struct notification_item));
+    g_banner_count = keep + 1;
+    g_banners[0] = *item;
   }
   rebuild();
 }

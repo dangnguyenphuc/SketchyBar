@@ -89,6 +89,14 @@
 #define ISLAND_CONTROL_GAP    8
 #define ISLAND_NOTICE_BAR     22
 
+// Claude tab: the two subtabs' switch on top, rows of glass cards below.
+#define ISLAND_CLAUDE_TABS    18
+#define ISLAND_CLAUDE_ROW     32   // row pitch, the card is ROW - ROW_GAP
+#define ISLAND_CLAUDE_ROW_GAP 4
+#define ISLAND_CLAUDE_CLOSE   14
+// Claude's terracotta, for its spark and Clawd.
+#define ISLAND_COLOR_CLAUDE   0xffd97757
+
 // Apps tab: a header, one row per app (icon, name, switch) below it.
 #define ISLAND_APP_ROW        22
 #define ISLAND_APP_ROW_ICON   16
@@ -133,15 +141,18 @@ static const struct {
   [ISLAND_SERVICE_BLUETOOTH] = { "bluetooth", "\xEF\x8A\x93", "B" },  // U+F293 bluetooth
   [ISLAND_SERVICE_SCREENS]   = { "screens",   "\xEF\x80\x89", "D" },  // U+F009 th-large
   [ISLAND_SERVICE_APPS]      = { "apps",      "\xEF\x87\x9E", "N" },  // U+F1DE sliders
+  // Drawn as Claude's spark (island_draw_spark), not a glyph.
+  [ISLAND_SERVICE_CLAUDE]    = { "claude",    NULL,           "C" },
 };
 
 // The column's tabs, top to bottom (see island_set_tabs).
 static int g_tabs[ISLAND_SERVICE_COUNT] = { ISLAND_SERVICE_ALERTS,
+                                            ISLAND_SERVICE_CLAUDE,
                                             ISLAND_SERVICE_MUSIC,
                                             ISLAND_SERVICE_SYSTEM,
                                             ISLAND_SERVICE_BLUETOOTH,
                                             ISLAND_SERVICE_APPS       };
-static int g_tab_count = 5;
+static int g_tab_count = 6;
 
 bool island_set_tabs(const char* list, char* error, size_t size) {
   int tabs[ISLAND_SERVICE_COUNT];
@@ -162,8 +173,8 @@ bool island_set_tabs(const char* list, char* error, size_t size) {
       if (strcasecmp(part, g_services[i].name) == 0) service = i;
     }
     if (service < 0) {
-      snprintf(error, size, "unknown tab '%s' (alerts, music, system, "
-                            "bluetooth, screens, apps)", part         );
+      snprintf(error, size, "unknown tab '%s' (alerts, claude, music, "
+                            "system, bluetooth, screens, apps)", part  );
       return false;
     }
     bool duplicate = false;
@@ -358,6 +369,8 @@ void island_open(struct island* island, const char* family) {
   island->toggles_ready = false;
   island->cards_synced = false;
   island->app_toggle_progress = 1.0;
+  island->claude_previous_subtab = island->claude_subtab;
+  island->claude_transition = 1.0;
   if (g_loaded) return;
 
   if (!family) family = font_default_family();
@@ -654,6 +667,182 @@ static void island_draw_glass(CGContextRef context,
   CGContextRestoreGState(context);
 }
 
+// ---------------------------------------------------------------- claude art
+
+// Claude's spark: rays of slightly different lengths around the center.
+static void island_draw_spark(CGContextRef context,
+                              CGPoint center,
+                              CGFloat radius,
+                              uint32_t color,
+                              CGFloat alpha  ) {
+  static const double lengths[] = { 1.0, 0.8, 0.94, 0.76, 1.0, 0.84,
+                                    0.92, 0.78, 0.98, 0.82, 0.9      };
+  int rays = sizeof(lengths) / sizeof(lengths[0]);
+
+  CGContextSaveGState(context);
+  CGContextSetRGBStrokeColor(context,
+                             ((color >> 16) & 0xff) / 255.0,
+                             ((color >> 8) & 0xff) / 255.0,
+                             (color & 0xff) / 255.0,
+                             ((color >> 24) & 0xff) / 255.0 * alpha);
+  CGContextSetLineCap(context, kCGLineCapRound);
+  CGContextSetLineWidth(context, max(radius * 0.22, 1.0));
+  for (int i = 0; i < rays; i++) {
+    double angle = M_PI / 2.0 + i * 2.0 * M_PI / rays;
+    CGFloat inner = radius * 0.15;
+    CGFloat outer = radius * lengths[i] - radius * 0.11;
+    CGContextMoveToPoint(context, center.x + inner * cos(angle),
+                                  center.y + inner * sin(angle) );
+    CGContextAddLineToPoint(context, center.x + outer * cos(angle),
+                                     center.y + outer * sin(angle) );
+  }
+  CGContextStrokePath(context);
+  CGContextRestoreGState(context);
+}
+
+// Clawd, Claude Code's mascot, as in its terminal banner: a 16 x 5 grid of
+// tall pixels (quarter blocks are about twice as tall as wide), top row
+// first. Rows: head, eyes (holes at 4 and 11), arms, body, legs.
+enum clawd_mood { CLAWD_IDLE, CLAWD_BUSY, CLAWD_HAPPY, CLAWD_SLEEPING };
+#define CLAWD_COLUMNS 16
+#define CLAWD_ROWS    5
+#define CLAWD_ASPECT  1.8
+
+static bool g_animated = false;
+
+bool island_animating(void) {
+  return g_animated;
+}
+
+void island_animation_reset(void) {
+  g_animated = false;
+}
+
+static void island_clawd_cell(CGContextRef context,
+                              CGPoint top_left,
+                              CGFloat width,
+                              CGFloat height,
+                              CGFloat column,
+                              CGFloat row      ) {
+  // A hair of overlap so neighbouring cells don't show seams.
+  CGContextFillRect(context, CGRectMake(top_left.x + column * width - 0.15,
+                                        top_left.y - (row + 1) * height
+                                                   - 0.15,
+                                        width + 0.3, height + 0.3       ));
+}
+
+// Draws Clawd as large as fits in `rect`. Every mood but IDLE moves: BUSY
+// walks, HAPPY bounces and waves, SLEEPING breathes with closed eyes and
+// floating z's. Moving ones mark the island as animating.
+static void island_draw_clawd(CGContextRef context,
+                              CGRect rect,
+                              int mood,
+                              CGFloat alpha       ) {
+  double t = CFAbsoluteTimeGetCurrent();
+  int frame = (int)(t * ISLAND_SPRITE_FPS);
+  if (mood != CLAWD_IDLE) g_animated = true;
+
+  // Room above for the bounce (happy) or the z's (sleeping).
+  CGFloat room = mood == CLAWD_HAPPY ? 0.8 : (mood == CLAWD_SLEEPING ? 1.2 : 0);
+  CGFloat width = min(rect.size.width / CLAWD_COLUMNS,
+                      rect.size.height / ((CLAWD_ROWS + room) * CLAWD_ASPECT));
+  CGFloat height = width * CLAWD_ASPECT;
+  CGFloat total = (CLAWD_ROWS + room) * height;
+  CGPoint top_left = { CGRectGetMidX(rect) - CLAWD_COLUMNS * width / 2.0,
+                       CGRectGetMidY(rect) + total / 2.0 - room * height };
+
+  if (mood == CLAWD_HAPPY) {
+    top_left.y += fabs(sin(t * M_PI * 2.2)) * height * 0.8;
+  } else if (mood == CLAWD_SLEEPING) {
+    top_left.y += sin(t * 2.0 * M_PI / 3.0) * height * 0.12;
+  }
+
+  CGContextSaveGState(context);
+  island_set_fill(context, ISLAND_COLOR_CLAUDE, alpha);
+
+  // Head and body.
+  for (int c = 2; c <= 13; c++) {
+    island_clawd_cell(context, top_left, width, height, c, 0);
+    island_clawd_cell(context, top_left, width, height, c, 3);
+    bool eye = c == 4 || c == 11;
+    if (!eye || mood == CLAWD_SLEEPING)
+      island_clawd_cell(context, top_left, width, height, c, 1);
+    island_clawd_cell(context, top_left, width, height, c, 2);
+  }
+
+  // Arms: out to the sides; resting low while asleep; waving when happy.
+  int left_row = 2, right_row = 2;
+  if (mood == CLAWD_SLEEPING) left_row = right_row = 3;
+  if (mood == CLAWD_HAPPY) {
+    bool swap = (frame / 2) % 2;
+    left_row = swap ? 1 : 2;
+    right_row = swap ? 2 : 1;
+  }
+  for (int c = 0; c < 2; c++) {
+    island_clawd_cell(context, top_left, width, height, c, left_row);
+    island_clawd_cell(context, top_left, width, height, 14 + c, right_row);
+  }
+
+  // Legs, stepping while busy.
+  static const int legs[2][4] = { { 3, 5, 10, 12 }, { 2, 4, 11, 13 } };
+  int step = mood == CLAWD_BUSY ? (frame / 2) % 2 : 0;
+  for (int i = 0; i < 4; i++)
+    island_clawd_cell(context, top_left, width, height, legs[step][i], 4);
+
+  // Closed eyes: a dark line low in each eye cell.
+  if (mood == CLAWD_SLEEPING) {
+    island_set_fill(context, 0xff1a1a1a, alpha);
+    for (int i = 0; i < 2; i++) {
+      CGFloat column = i == 0 ? 4 : 11;
+      CGContextFillRect(context,
+                        CGRectMake(top_left.x + column * width - width * 0.3,
+                                   top_left.y - 2 * height + height * 0.25,
+                                   width * 1.6, max(height * 0.18, 0.75)   ));
+    }
+  }
+
+  // Happy: two sparkles blinking in turn above the arms.
+  if (mood == CLAWD_HAPPY) {
+    for (int i = 0; i < 2; i++) {
+      double blink = 0.5 + 0.5 * sin(t * 6.0 + i * M_PI);
+      CGFloat size = width * (0.8 + 0.6 * blink);
+      CGPoint at = { top_left.x + (i == 0 ? -0.5 : 16.5) * width,
+                     top_left.y + height * 0.4                   };
+      island_set_fill(context, 0xffffe08a, alpha * blink);
+      CGContextFillRect(context, CGRectMake(at.x - size / 2.0, at.y - width * 0.2,
+                                            size, width * 0.4                  ));
+      CGContextFillRect(context, CGRectMake(at.x - width * 0.2, at.y - size / 2.0,
+                                            width * 0.4, size                  ));
+    }
+  }
+  CGContextRestoreGState(context);
+
+  // Sleeping: z's rising from the head, growing and fading.
+  if (mood == CLAWD_SLEEPING && width >= 2.5) {
+    for (int i = 0; i < 3; i++) {
+      double phase = fmod(t / 2.4 + i / 3.0, 1.0);
+      CGFloat x = top_left.x + (13.5 + phase * 3.0) * width;
+      CGFloat y = top_left.y + phase * height * 1.4;
+      island_draw_text_colored(context, "z",
+                               phase < 0.5 ? g_fonts.caption : g_fonts.body,
+                               ISLAND_COLOR_WHITE,
+                               alpha * 0.8 * sin(phase * M_PI),
+                               x, y, 20, ALIGN_LEFT              );
+    }
+  }
+}
+
+// Clawd on a dark glass tile, where other notifications show an app icon.
+static void island_draw_clawd_tile(CGContextRef context, CGRect rect, int mood) {
+  island_add_rounded_rect(context, rect, ISLAND_APP_ICON_RADIUS);
+  island_set_fill(context, 0xff1f1a17, 1.0);
+  CGContextFillPath(context);
+  island_draw_glass(context, rect, ISLAND_APP_ICON_RADIUS, 1.0);
+  island_draw_clawd(context, CGRectInset(rect, rect.size.width * 0.1,
+                                         rect.size.height * 0.12     ),
+                    mood, 1.0                                         );
+}
+
 static double island_transition_progress(struct island* island) {
   if (island->previous_service == island->service) return 1.0;
   return max(min(island->transition, 1.0), 0.0);
@@ -687,6 +876,13 @@ static void island_draw_services(struct island* island,
                        - (CTFontGetAscent(g_fonts.icon)
                           - CTFontGetDescent(g_fonts.icon)) / 2.0;
 
+    if (service == ISLAND_SERVICE_CLAUDE) {
+      island_draw_spark(context,
+                        CGPointMake(CGRectGetMidX(row), CGRectGetMidY(row)),
+                        ISLAND_ICON_SIZE / 2.0, ISLAND_COLOR_CLAUDE,
+                        0.55 + 0.45 * weight                             );
+      continue;
+    }
     island_draw_text(context,
                      g_has_icons ? g_services[service].icon
                                  : g_services[service].fallback,
@@ -870,6 +1066,15 @@ static void island_draw_blossom(CGContextRef context,
 static void island_draw_app_icon(CGContextRef context,
                                  const char* app,
                                  CGRect rect      ) {
+  if (strcasecmp(app, CLAUDE_APP_NAME) == 0 || strcasecmp(app, "Claude") == 0) {
+    island_add_rounded_rect(context, rect, ISLAND_APP_ICON_RADIUS);
+    island_set_fill(context, 0xfff5f0e8, 1.0);
+    CGContextFillPath(context);
+    island_draw_spark(context,
+                      CGPointMake(CGRectGetMidX(rect), CGRectGetMidY(rect)),
+                      rect.size.width * 0.36, ISLAND_COLOR_CLAUDE, 1.0     );
+    return;
+  }
   int index = island_app_icon_index(app);
   if (index < 0) {
     island_draw_blossom(context, rect, island_blossom_color(app));
@@ -919,7 +1124,8 @@ static void island_draw_card(CGContextRef context,
   CGRect icon = {{ card.origin.x + ISLAND_CARD_INSET,
                    CGRectGetMidY(card) - ISLAND_APP_ICON_SIZE / 2.0 },
                  { ISLAND_APP_ICON_SIZE, ISLAND_APP_ICON_SIZE }};
-  island_draw_app_icon(context, notification->app, icon);
+  if (notification->claude) island_draw_clawd_tile(context, icon, CLAWD_HAPPY);
+  else island_draw_app_icon(context, notification->app, icon);
 
   CGFloat x = CGRectGetMaxX(icon) + ISLAND_APP_ICON_GAP;
   CGFloat right = CGRectGetMaxX(card) - ISLAND_CARD_INSET;
@@ -2180,6 +2386,403 @@ static bool island_handle_apps_click(struct island* island,
   return true;
 }
 
+// ---------------------------------------------------------------- claude
+
+// While Claude can't be reached: Clawd asleep and "Claude is currently busy"
+// (a click checks again). Otherwise two subtabs, Sessions and Top models,
+// switched by a segmented control on top; their pages lie side by side and
+// slide over (the later one comes in from the right).
+struct island_claude_layout {
+  CGRect page;
+  CGRect tabs;
+  CGRect tab[ISLAND_CLAUDE_SUBTABS];
+  CGRect content;
+  CGRect list;
+  CGRect track;
+};
+
+static struct island_claude_layout island_get_claude_layout(
+                                          struct island_layout* layout) {
+  struct island_claude_layout c;
+  c.page = island_page_rect(layout);
+  CGFloat top = CGRectGetMaxY(c.page);
+  c.tabs = (CGRect){{ c.page.origin.x, top - ISLAND_CLAUDE_TABS },
+                    { c.page.size.width, ISLAND_CLAUDE_TABS }};
+  CGFloat half = floor(c.page.size.width / 2.0);
+  c.tab[0] = (CGRect){ c.tabs.origin, { half, ISLAND_CLAUDE_TABS } };
+  c.tab[1] = (CGRect){{ c.tabs.origin.x + half, c.tabs.origin.y },
+                      { c.tabs.size.width - half, ISLAND_CLAUDE_TABS }};
+  c.content = (CGRect){{ c.page.origin.x, c.page.origin.y },
+                       { c.page.size.width,
+                         c.tabs.origin.y - 5 - c.page.origin.y }};
+  c.track = (CGRect){{ CGRectGetMaxX(c.content) - ISLAND_SCROLL_WIDTH,
+                       c.content.origin.y                             },
+                     { ISLAND_SCROLL_WIDTH, c.content.size.height }};
+  c.list = (CGRect){ c.content.origin,
+                     { c.track.origin.x - ISLAND_SCROLL_GAP
+                                        - c.content.origin.x,
+                       c.content.size.height                  }};
+  return c;
+}
+
+static int island_claude_rows(int subtab) {
+  const struct claude_state* state = claude_get();
+  return subtab == ISLAND_CLAUDE_SESSIONS ? state->session_count
+                                          : state->model_count;
+}
+
+static CGFloat island_claude_list_height(int subtab) {
+  int rows = island_claude_rows(subtab);
+  return rows > 0 ? rows * ISLAND_CLAUDE_ROW - ISLAND_CLAUDE_ROW_GAP : 0;
+}
+
+static CGFloat island_claude_max_scroll(struct island_claude_layout* c,
+                                        int subtab                    ) {
+  return max(island_claude_list_height(subtab) - c->list.size.height, 0);
+}
+
+static CGRect island_claude_row(struct island_claude_layout* c,
+                                int row,
+                                CGFloat scroll_offset         ) {
+  CGFloat top = CGRectGetMaxY(c->list) - row * ISLAND_CLAUDE_ROW
+                + scroll_offset;
+  CGFloat height = ISLAND_CLAUDE_ROW - ISLAND_CLAUDE_ROW_GAP;
+  return (CGRect){{ c->list.origin.x, top - height },
+                  { c->list.size.width, height }};
+}
+
+static CGRect island_claude_close_rect(CGRect row) {
+  return (CGRect){{ CGRectGetMaxX(row) - 7 - ISLAND_CLAUDE_CLOSE,
+                    CGRectGetMidY(row) - ISLAND_CLAUDE_CLOSE / 2.0 },
+                  { ISLAND_CLAUDE_CLOSE, ISLAND_CLAUDE_CLOSE }};
+}
+
+static double island_claude_progress(struct island* island) {
+  if (island->claude_previous_subtab == island->claude_subtab) return 1.0;
+  return max(min(island->claude_transition, 1.0), 0.0);
+}
+
+// "1M", "393K", "128K".
+static void island_format_tokens(int tokens, char* out, size_t size) {
+  if (tokens >= 1000000) {
+    double millions = tokens / 1000000.0;
+    snprintf(out, size, fabs(millions - round(millions)) < 0.05 ? "%.0fM"
+                                                                 : "%.1fM",
+             millions                                                      );
+  } else if (tokens >= 1000) {
+    snprintf(out, size, "%.0fK", tokens / 1000.0);
+  } else {
+    snprintf(out, size, "%d", tokens);
+  }
+}
+
+// "4", "0.2", "0.03": two decimals at most, no trailing zeros.
+static void island_format_price(double price, char* out, size_t size) {
+  snprintf(out, size, "%.2f", price);
+  char* end = out + strlen(out) - 1;
+  while (end > out && *end == '0') *end-- = '\0';
+  if (end > out && *end == '.') *end = '\0';
+}
+
+static void island_draw_claude_busy(CGContextRef context,
+                                    struct island_claude_layout* c,
+                                    int reachability              ) {
+  CGRect page = c->page;
+  CGRect sprite = {{ CGRectGetMidX(page) - 44, CGRectGetMidY(page) - 6 },
+                   { 88, 50 }};
+  bool checking = reachability == CLAUDE_CHECKING;
+  island_draw_clawd(context, sprite, checking ? CLAWD_BUSY : CLAWD_SLEEPING,
+                    1.0                                                   );
+  island_draw_text(context,
+                   checking ? "Checking on Claude…" : "Claude is currently busy",
+                   g_fonts.title, 0.95,
+                   CGRectGetMidX(page), sprite.origin.y - 14,
+                   page.size.width, ALIGN_CENTER             );
+  if (!checking) {
+    island_draw_text(context, "Can't reach Claude from here · click to retry",
+                     g_fonts.caption, 0.45,
+                     CGRectGetMidX(page), sprite.origin.y - 27,
+                     page.size.width, ALIGN_CENTER             );
+  }
+}
+
+static void island_draw_claude_tabs(CGContextRef context,
+                                    struct island* island,
+                                    struct island_claude_layout* c) {
+  island_add_rounded_rect(context, c->tabs, ISLAND_CLAUDE_TABS / 2.0);
+  island_set_fill(context, ISLAND_COLOR_WHITE, 0.06);
+  CGContextFillPath(context);
+
+  // The pill glides between the halves.
+  double t = island_claude_progress(island);
+  CGRect from = c->tab[island->claude_previous_subtab];
+  CGRect pill = c->tab[island->claude_subtab];
+  pill.origin.x = from.origin.x + (pill.origin.x - from.origin.x) * t;
+  island_draw_glass(context, CGRectInset(pill, 1, 1),
+                    ISLAND_CLAUDE_TABS / 2.0 - 1, 1.2);
+
+  char sessions[32];
+  int count = claude_get()->session_count;
+  if (count > 0) snprintf(sessions, sizeof(sessions), "Sessions · %d", count);
+  else snprintf(sessions, sizeof(sessions), "Sessions");
+  const char* labels[ISLAND_CLAUDE_SUBTABS] = { sessions, "Top models" };
+  for (int i = 0; i < ISLAND_CLAUDE_SUBTABS; i++) {
+    double weight = 0;
+    if (i == island->claude_subtab) weight += t;
+    if (i == island->claude_previous_subtab) weight += 1.0 - t;
+    island_draw_text(context, labels[i], g_fonts.body, 0.5 + 0.45 * weight,
+                     CGRectGetMidX(c->tab[i]), CGRectGetMidY(c->tab[i]) - 3,
+                     c->tab[i].size.width - 8, ALIGN_CENTER                );
+  }
+}
+
+static void island_draw_claude_card(CGContextRef context, CGRect row) {
+  island_add_rounded_rect(context, row, 8);
+  island_set_fill(context, 0xff000000, 0.6);
+  CGContextFillPath(context);
+  island_draw_glass(context, row, 8, 0.9);
+}
+
+static void island_draw_claude_sessions(CGContextRef context,
+                                        struct island_claude_layout* c,
+                                        CGFloat scroll_offset         ) {
+  const struct claude_state* state = claude_get();
+  if (state->session_count == 0) {
+    island_draw_bluetooth_message(context, c->list, "No Claude sessions running");
+    return;
+  }
+
+  for (int i = 0; i < state->session_count; i++) {
+    CGRect row = island_claude_row(c, i, scroll_offset);
+    if (!CGRectIntersectsRect(row, c->list)) continue;
+    const struct claude_session* session = &state->sessions[i];
+    island_draw_claude_card(context, row);
+
+    CGRect sprite = {{ row.origin.x + 5, CGRectGetMidY(row) - 8 }, { 24, 16 }};
+    island_draw_clawd(context, sprite, session->busy ? CLAWD_BUSY : CLAWD_IDLE,
+                      session->busy ? 1.0 : 0.7                              );
+
+    CGRect close = island_claude_close_rect(row);
+    island_draw_glass(context, close, close.size.width / 2.0, 1.3);
+    island_draw_glyph(context, g_glyphs[GLYPH_CROSS], g_fonts.stats_icon,
+                      ISLAND_COLOR_WHITE, 0.8, close                     );
+
+    CGFloat x = CGRectGetMaxX(sprite) + 7;
+    CGFloat width = close.origin.x - 6 - x;
+    CGFloat top = CGRectGetMaxY(row);
+    island_draw_text(context, session->name, g_fonts.title, 0.95,
+                     x, top - 12, width, ALIGN_LEFT              );
+
+    char when[16], details[192];
+    island_relative_time(session->started, when, sizeof(when));
+    if (session->busy) {
+      snprintf(details, sizeof(details), "Working · %s · %s",
+               session->project, session->where              );
+    } else {
+      snprintf(details, sizeof(details), "%s · %s · %s",
+               session->project, session->where, when    );
+    }
+    island_draw_text_colored(context, details, g_fonts.caption,
+                             session->busy ? ISLAND_COLOR_CLAUDE
+                                           : ISLAND_COLOR_WHITE,
+                             session->busy ? 0.95 : 0.5,
+                             x, top - 23, width, ALIGN_LEFT      );
+  }
+  island_draw_scroll_bar(context, c->track,
+                         island_claude_list_height(ISLAND_CLAUDE_SESSIONS),
+                         c->list.size.height, scroll_offset               );
+}
+
+static void island_draw_claude_models(CGContextRef context,
+                                      struct island_claude_layout* c,
+                                      CGFloat scroll_offset         ) {
+  const struct claude_state* state = claude_get();
+  if (state->model_count == 0) {
+    island_draw_bluetooth_message(context, c->list,
+                                  state->models_loading
+                                  ? "Capturing the top models…"
+                                  : state->models_failed
+                                    ? "Couldn't capture models · click to retry"
+                                    : "No models captured yet"              );
+    return;
+  }
+
+  for (int i = 0; i < state->model_count; i++) {
+    CGRect row = island_claude_row(c, i, scroll_offset);
+    if (!CGRectIntersectsRect(row, c->list)) continue;
+    const struct claude_model* model = &state->models[i];
+    island_draw_claude_card(context, row);
+
+    // Rank badge, Claude's color for Anthropic's models.
+    bool anthropic = strcasecmp(model->provider, "Anthropic") == 0;
+    CGRect badge = {{ row.origin.x + 6, CGRectGetMidY(row) - 8 }, { 16, 16 }};
+    island_add_rounded_rect(context, badge, 8);
+    island_set_fill(context, anthropic ? ISLAND_COLOR_CLAUDE
+                                       : ISLAND_COLOR_WHITE,
+                    anthropic ? 0.9 : 0.14                  );
+    CGContextFillPath(context);
+    char rank[4];
+    snprintf(rank, sizeof(rank), "%d", i + 1);
+    island_draw_text(context, rank, g_fonts.caption, 0.95,
+                     CGRectGetMidX(badge), CGRectGetMidY(badge) - 3,
+                     badge.size.width, ALIGN_CENTER                );
+
+    CGFloat x = CGRectGetMaxX(badge) + 7;
+    CGFloat right = CGRectGetMaxX(row) - 7;
+    CGFloat top = CGRectGetMaxY(row);
+
+    // Name, and its weekly usage on the right.
+    CGFloat usage_width = 0;
+    if (model->usage[0]) {
+      char usage[24];
+      snprintf(usage, sizeof(usage), "%s/wk", model->usage);
+      usage_width = island_draw_text_colored(context, usage, g_fonts.caption,
+                                             ISLAND_COLOR_CLAUDE, 0.9,
+                                             right, top - 12, 60, ALIGN_RIGHT);
+    }
+    island_draw_text(context, model->name, g_fonts.title, 0.95,
+                     x, top - 12, right - x - usage_width - 6, ALIGN_LEFT);
+
+    // Provider · context · output · price · features.
+    char details[256], context_text[16], output[16];
+    int length = snprintf(details, sizeof(details), "%s", model->provider);
+    if (model->context > 0) {
+      island_format_tokens(model->context, context_text, sizeof(context_text));
+      length += snprintf(details + length, sizeof(details) - length,
+                         " · %s ctx", context_text                  );
+    }
+    if (model->max_output > 0 && length < sizeof(details)) {
+      island_format_tokens(model->max_output, output, sizeof(output));
+      length += snprintf(details + length, sizeof(details) - length,
+                         " · %s out", output                        );
+    }
+    if (model->price_in >= 0 && model->price_out >= 0
+        && length < sizeof(details)                  ) {
+      if (model->price_in == 0 && model->price_out == 0) {
+        length += snprintf(details + length, sizeof(details) - length,
+                           " · free"                                  );
+      } else {
+        char in[16], out[16];
+        island_format_price(model->price_in, in, sizeof(in));
+        island_format_price(model->price_out, out, sizeof(out));
+        length += snprintf(details + length, sizeof(details) - length,
+                           " · $%s/$%s", in, out                      );
+      }
+    }
+    if (model->features[0] && length < sizeof(details)) {
+      snprintf(details + length, sizeof(details) - length, " · %s",
+               model->features                                     );
+    }
+    island_draw_text(context, details, g_fonts.caption, 0.5,
+                     x, top - 23, right - x, ALIGN_LEFT     );
+  }
+  island_draw_scroll_bar(context, c->track,
+                         island_claude_list_height(ISLAND_CLAUDE_MODELS),
+                         c->list.size.height, scroll_offset             );
+}
+
+static void island_draw_claude_subtab(CGContextRef context,
+                                      struct island_claude_layout* c,
+                                      int subtab,
+                                      CGFloat scroll_offset,
+                                      CGFloat dx,
+                                      CGFloat alpha                 ) {
+  CGContextSaveGState(context);
+  CGContextTranslateCTM(context, dx, 0);
+  CGContextSetAlpha(context, alpha);
+  if (subtab == ISLAND_CLAUDE_SESSIONS)
+    island_draw_claude_sessions(context, c, scroll_offset);
+  else
+    island_draw_claude_models(context, c, scroll_offset);
+  CGContextRestoreGState(context);
+}
+
+static void island_draw_claude(CGContextRef context,
+                               struct island_layout* layout,
+                               CGFloat scroll_offset       ) {
+  if (!g_drawing) return;
+  struct island* island = g_drawing;
+  struct island_claude_layout c = island_get_claude_layout(layout);
+  const struct claude_state* state = claude_get();
+
+  if (state->reachability != CLAUDE_REACHABLE) {
+    island_draw_claude_busy(context, &c, state->reachability);
+    return;
+  }
+
+  island_draw_claude_tabs(context, island, &c);
+
+  CGContextSaveGState(context);
+  CGContextClipToRect(context, c.content);
+  double t = island_claude_progress(island);
+  if (t >= 1.0) {
+    island_draw_claude_subtab(context, &c, island->claude_subtab,
+                              scroll_offset, 0, 1.0              );
+  } else {
+    // The later subtab lies to the right: going there moves both pages
+    // left, going back moves them right.
+    CGFloat direction = island->claude_subtab > island->claude_previous_subtab
+                        ? -1 : 1;
+    CGFloat distance = c.content.size.width + ISLAND_PAGE_GAP;
+    CGFloat fade = 1.0 - ISLAND_PAGE_MIN_ALPHA;
+    island_draw_claude_subtab(context, &c, island->claude_previous_subtab,
+                              island->claude_previous_scroll,
+                              direction * distance * t, 1.0 - fade * t    );
+    island_draw_claude_subtab(context, &c, island->claude_subtab,
+                              scroll_offset,
+                              -direction * distance * (1.0 - t),
+                              ISLAND_PAGE_MIN_ALPHA + fade * t  );
+  }
+  CGContextRestoreGState(context);
+}
+
+static bool island_handle_claude_click(struct island* island,
+                                       struct island_layout* layout,
+                                       CGPoint point,
+                                       struct island_action* action) {
+  struct island_claude_layout c = island_get_claude_layout(layout);
+  if (!CGRectContainsPoint(c.page, point)) return false;
+  const struct claude_state* state = claude_get();
+
+  if (state->reachability != CLAUDE_REACHABLE) {
+    action->type = ISLAND_ACTION_CLAUDE_RETRY;
+    return true;
+  }
+
+  for (int i = 0; i < ISLAND_CLAUDE_SUBTABS; i++) {
+    if (!CGRectContainsPoint(c.tab[i], point)) continue;
+    if (island->claude_subtab != i) {
+      island->claude_previous_subtab = island->claude_subtab;
+      island->claude_previous_scroll = island->scroll_offset;
+      island->claude_subtab = i;
+      island->claude_transition = 0;
+      island->scroll_offset = 0;
+      island->scroll_target = 0;
+      action->type = ISLAND_ACTION_CLAUDE_SUBTAB;
+    }
+    return true;
+  }
+  if (!CGRectContainsPoint(c.list, point)) return true;
+
+  if (island->claude_subtab == ISLAND_CLAUDE_MODELS) {
+    if (state->model_count == 0 && !state->models_loading)
+      action->type = ISLAND_ACTION_CLAUDE_REFRESH;
+    return true;
+  }
+
+  for (int i = 0; i < state->session_count; i++) {
+    CGRect row = island_claude_row(&c, i, island->scroll_offset);
+    if (!CGRectContainsPoint(row, point)) continue;
+    bool close = CGRectContainsPoint(
+                   CGRectInset(island_claude_close_rect(row), -4, -4), point);
+    action->type = close ? ISLAND_ACTION_CLAUDE_STOP
+                         : ISLAND_ACTION_CLAUDE_OPEN;
+    action->index = i;
+    break;
+  }
+  return true;
+}
+
 static void island_draw_page(CGContextRef context,
                              struct island_layout* layout,
                              int service,
@@ -2202,6 +2805,9 @@ static void island_draw_page(CGContextRef context,
       break;
     case ISLAND_SERVICE_APPS:
       island_draw_apps(context, layout, scroll_offset);
+      break;
+    case ISLAND_SERVICE_CLAUDE:
+      island_draw_claude(context, layout, scroll_offset);
       break;
   }
 }
@@ -2525,6 +3131,11 @@ bool island_handle_click(struct island* island,
     return true;
   }
 
+  if (island->service == ISLAND_SERVICE_CLAUDE
+      && island_handle_claude_click(island, &layout, point, action)) {
+    return true;
+  }
+
   // System: the brightness slider; the rest of the page swallows clicks.
   if (island->service == ISLAND_SERVICE_SYSTEM
       && CGRectContainsPoint(island_page_rect(&layout), point)) {
@@ -2655,7 +3266,8 @@ void island_draw_peek(CGContextRef context,
   CGContextSaveGState(context);
   CGContextSetAlpha(context, max(min(alpha, 1.0), 0.0));
 
-  island_draw_app_icon(context, item->app, icon);
+  if (item->claude) island_draw_clawd_tile(context, icon, CLAWD_HAPPY);
+  else island_draw_app_icon(context, item->app, icon);
   CGFloat baseline = CGRectGetMidY(text_rect)
                      - (CTFontGetAscent(g_fonts.peek)
                         - CTFontGetDescent(g_fonts.peek)) / 2.0;
@@ -2674,6 +3286,9 @@ void island_clamp_scroll(struct island* island, CGRect panel) {
   } else if (island->service == ISLAND_SERVICE_APPS) {
     struct island_apps_layout a = island_get_apps_layout(&layout);
     max_scroll = island_apps_max_scroll(&a);
+  } else if (island->service == ISLAND_SERVICE_CLAUDE) {
+    struct island_claude_layout c = island_get_claude_layout(&layout);
+    max_scroll = island_claude_max_scroll(&c, island->claude_subtab);
   } else {
     return;
   }
@@ -2699,6 +3314,9 @@ bool island_handle_scroll(struct island* island,
   } else if (island->service == ISLAND_SERVICE_APPS) {
     struct island_apps_layout a = island_get_apps_layout(&layout);
     max_scroll = island_apps_max_scroll(&a);
+  } else if (island->service == ISLAND_SERVICE_CLAUDE) {
+    struct island_claude_layout c = island_get_claude_layout(&layout);
+    max_scroll = island_claude_max_scroll(&c, island->claude_subtab);
   } else {
     return true;
   }

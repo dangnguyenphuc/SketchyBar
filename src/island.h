@@ -7,6 +7,7 @@
 #include "connections.h"
 #include "desktops.h"
 #include "notifications.h"
+#include "claude.h"
 
 // Content drawn inside the expanded notch island: a services column on the
 // left, a divider, and the selected service's panel on the right (for Alerts:
@@ -23,14 +24,16 @@ enum island_service {
   ISLAND_SERVICE_BLUETOOTH,
   ISLAND_SERVICE_SCREENS,
   ISLAND_SERVICE_APPS,
+  ISLAND_SERVICE_CLAUDE,
   ISLAND_SERVICE_COUNT
 };
 
 // Which services the column shows, top to bottom (sketchybarrc:
-// --bar island_tabs=alerts,music,system,bluetooth,apps). Names: alerts,
-// music, system, bluetooth, screens, apps; each at most once. The column
-// spreads its icons evenly over its height, however many there are.
-#define ISLAND_TABS_DEFAULT "alerts,music,system,bluetooth,apps"
+// --bar island_tabs=alerts,claude,music,system,bluetooth,apps). Names:
+// alerts, claude, music, system, bluetooth, screens, apps; each at most once.
+// The column spreads its icons evenly over its height, however many there
+// are.
+#define ISLAND_TABS_DEFAULT "alerts,claude,music,system,bluetooth,apps"
 
 // Sets the tabs from a comma separated list. False (nothing changed, `error`
 // says why) for an unknown name or an empty list.
@@ -82,6 +85,13 @@ struct island {
   char app_toggle[64];
   double app_toggle_progress;
 
+  // Claude tab: its subtabs (ISLAND_CLAUDE_*) slide sideways while
+  // `claude_transition` goes 0 -> 1, animated by the bar.
+  int claude_subtab;
+  int claude_previous_subtab;
+  CGFloat claude_previous_scroll;
+  double claude_transition;
+
   // Alerts tab cards (see island_sync_cards). `cards_synced` false: the next
   // sync places them without animating (just opened).
   struct island_card cards[ISLAND_CARDS_MAX];
@@ -90,6 +100,8 @@ struct island {
 };
 
 enum { ISLAND_TOGGLE_WIFI, ISLAND_TOGGLE_BLUETOOTH };
+
+enum { ISLAND_CLAUDE_SESSIONS, ISLAND_CLAUDE_MODELS, ISLAND_CLAUDE_SUBTABS };
 
 // Live data shown in the island, owned by the bar (only valid while open).
 struct island_data {
@@ -137,7 +149,12 @@ enum island_action_type {
   ISLAND_ACTION_NOTIFICATION_OPEN,
   ISLAND_ACTION_NOTIFICATION_DISMISS,
   ISLAND_ACTION_NOTIFICATIONS_READ_ALL,
-  ISLAND_ACTION_APP_TOGGLE
+  ISLAND_ACTION_APP_TOGGLE,
+  ISLAND_ACTION_CLAUDE_SUBTAB,     // switched; the bar animates it
+  ISLAND_ACTION_CLAUDE_OPEN,       // open the session's folder in VS Code
+  ISLAND_ACTION_CLAUDE_STOP,       // end the session
+  ISLAND_ACTION_CLAUDE_RETRY,      // check reachability again
+  ISLAND_ACTION_CLAUDE_REFRESH     // capture the top models again
 };
 
 struct island_action {
@@ -146,7 +163,8 @@ struct island_action {
   int index;     // BLUETOOTH_SELECT: index into the device list;
                  // SCREEN_SELECT: the desktop; NOTIFICATION_OPEN/DISMISS:
                  // index into the captured notifications; APP_TOGGLE: index
-                 // into notifications_apps()
+                 // into notifications_apps(); CLAUDE_OPEN/STOP: index into
+                 // claude_get()->sessions
 };
 
 // `family` is the text font family (the bar's default font); NULL uses the
@@ -190,6 +208,13 @@ void island_draw_peek(CGContextRef context,
                       CGRect icon,
                       CGRect text_rect,
                       double alpha                       );
+
+// Sprite animations (Clawd): island drawing notes when it drew one that
+// moves. The bar redraws at ISLAND_SPRITE_FPS while that is the case:
+// island_animation_reset() before a redraw, island_animating() after it.
+#define ISLAND_SPRITE_FPS 10
+bool island_animating(void);
+void island_animation_reset(void);
 
 // Alerts cards: island_sync_cards matches the drawn cards to the captured
 // notifications (new ones slide in, gone ones slide out) and returns whether

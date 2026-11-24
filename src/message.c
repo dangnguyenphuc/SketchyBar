@@ -8,6 +8,7 @@
 #include "media.h"
 #include "wifi.h"
 #include "power.h"
+#include "claude.h"
 
 extern struct bar_manager g_bar_manager;
 
@@ -61,6 +62,31 @@ static void handle_domain_subscribe(FILE* rsp, struct token domain, char* messag
   struct bar_item* bar_item = g_bar_manager.bar_items[item_index_for_name];
 
   bar_item_parse_subscribe_message(bar_item, message, rsp);
+}
+
+// sketchybar --claude event=<stop|attention> session=<id> name=<name>
+//                     cwd=<folder> message=<text>
+// Sent by Claude Code's hook (plugins/claude_hook.py).
+static void handle_domain_claude(FILE* rsp, char* message) {
+  const char *event = NULL, *session = NULL, *name = NULL, *cwd = NULL,
+             *text = NULL;
+  struct token token = get_token(&message);
+  while (token.text && token.length > 0) {
+    struct key_value_pair pair = get_key_value_pair(token.text, '=');
+    if (pair.key) {
+      if (strcmp(pair.key, "event") == 0) event = pair.value;
+      else if (strcmp(pair.key, "session") == 0) session = pair.value;
+      else if (strcmp(pair.key, "name") == 0) name = pair.value;
+      else if (strcmp(pair.key, "cwd") == 0) cwd = pair.value;
+      else if (strcmp(pair.key, "message") == 0) text = pair.value;
+    }
+    token = get_token(&message);
+  }
+  if (!event) {
+    respond(rsp, "[!] Claude: Expected event=<stop|attention>\n");
+    return;
+  }
+  claude_handle_event(event, session, name, cwd, text);
 }
 
 static void handle_domain_trigger(FILE* rsp, struct token domain, char* message) {
@@ -405,6 +431,24 @@ static bool handle_domain_bar(FILE *rsp, struct token domain, char *message) {
   } else if (token_equals(command, PROPERTY_NOTIFICATION_PER_APP)) {
     struct token token = get_token(&message);
     notifications_set_per_app(token_to_int(token));
+  } else if (token_equals(command, PROPERTY_CLAUDE_CHECK_URL)) {
+    char* url = token_to_string(get_token(&message));
+    claude_set_check_url(url);
+    free(url);
+  } else if (token_equals(command, PROPERTY_CLAUDE_CHECK_COMMAND)) {
+    char* command_line = token_to_string(get_token(&message));
+    claude_set_check_command(command_line);
+    free(command_line);
+  } else if (token_equals(command, PROPERTY_CLAUDE_CHECK_INTERVAL)) {
+    claude_set_check_interval(token_to_float(get_token(&message)));
+  } else if (token_equals(command, PROPERTY_CLAUDE_MODELS_SCRIPT)) {
+    char* path = token_to_string(get_token(&message));
+    claude_set_models_script(path);
+    free(path);
+  } else if (token_equals(command, PROPERTY_CLAUDE_MODELS_FILE)) {
+    char* path = token_to_string(get_token(&message));
+    claude_set_models_file(path);
+    free(path);
   } else if (token_equals(command, PROPERTY_HIDDEN)) {
     struct token state = get_token(&message);
     uint32_t adid = 0;
@@ -725,6 +769,10 @@ void handle_message_mach(struct mach_buffer* buffer) {
     } else if (token_equals(command, DOMAIN_UPDATE)) {
       bar_manager_update(&g_bar_manager, true);
       bar_needs_refresh = true;
+    } else if (token_equals(command, DOMAIN_CLAUDE)) {
+      char* rbr_msg = get_batch_line(&message);
+      handle_domain_claude(rsp, rbr_msg);
+      free(rbr_msg);
     } else if (token_equals(command, DOMAIN_TRIGGER)) {
       char* rbr_msg = get_batch_line(&message);
       handle_domain_trigger(rsp, command, rbr_msg);

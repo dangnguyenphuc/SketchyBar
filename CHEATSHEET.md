@@ -12,6 +12,7 @@ else in SketchyBar (items, events, scripting), see the
 - [All settings](#all-settings)
 - [Recipes](#recipes)
 - [Choosing which apps are captured](#choosing-which-apps-are-captured)
+- [Claude tab and "done" notifications](#claude-tab-and-done-notifications)
 - [Permissions](#permissions)
 - [Troubleshooting](#troubleshooting)
 
@@ -46,6 +47,7 @@ icons evenly over its height, so any number of tabs fits.
 | Name | Shows | Clicks |
 |---|---|---|
 | `alerts` | Captured notifications as cards, "N unread", **Read all** | Card opens its app and marks it read; ✕ only marks it read |
+| `claude` | Claude Code: **Sessions** running on this Mac and today's **Top models**; a sleeping Clawd and "Claude is currently busy" when Claude can't be reached | Session opens its folder in VS Code; ✕ ends that session; busy screen checks again |
 | `music` | Now playing (Spotify / Apple Music), artwork, volume, output device | Previous, play/pause, next, mute, volume slider |
 | `system` | OS, hardware, network, Wi-Fi switch, brightness, CPU/RAM graphs | Wi-Fi on/off, Wi-Fi settings, brightness slider |
 | `bluetooth` | Paired devices with battery levels | Bluetooth on/off, settings, click a device to connect or disconnect |
@@ -65,12 +67,22 @@ and is lost on restart.
 
 | Setting | Default | Accepts | What it does |
 |---|---|---|---|
-| `island_tabs` | `alerts,music,system,bluetooth,apps` | comma-separated tab names | Which tabs show, top to bottom. Unknown names are rejected. |
+| `island_tabs` | `alerts,claude,music,system,bluetooth,apps` | comma-separated tab names | Which tabs show, top to bottom. Unknown names are rejected. |
 | `island_idle_timeout` | `60` | seconds, `0` = never | Seconds without interaction before the open island closes itself |
 | `notification_scan_interval` | `1` | `0.2` – `60` seconds | How often notifications are captured. Banners stay on screen about 5 s, so keep it under that. |
 | `notification_peek_duration` | `2.5` | seconds, `0` = off | How long a new notification shows in the closed island |
 | `notification_peek_chars` | `50` | `1` – `200` | Maximum length of that preview, then "..." |
 | `notification_per_app` | `5` | `1` – `50` | Unread notifications kept per app (newest win) |
+
+### Claude tab (this fork)
+
+| Setting | Default | Accepts | What it does |
+|---|---|---|---|
+| `claude_check_url` | `https://api.anthropic.com` | URL | Claude counts as reachable when this answers at all (any HTTP status) |
+| `claude_check_command` | *(none)* | shell command | If set, used instead of the URL: exit status `0` = reachable. Use it for a VPN check. |
+| `claude_check_interval` | `30` | seconds, min `5` | How often reachability is checked while the tab is open |
+| `claude_models_script` | `plugins/claude_models.py` | path (relative to `sketchybarrc`) | Scraper that captures the top models |
+| `claude_models_file` | `~/.cache/sketchybar/claude_models.json` | path | Where the scraper writes; the tab only shows this file. Re-captured when older than 6 h. |
 
 ### Notch and bar shape
 
@@ -120,7 +132,14 @@ island shows letters instead of icons.
 ./bin/sketchybar --bar island_tabs=music,alerts,system,apps
 
 # Bring the Screens grid back (as the last tab)
-./bin/sketchybar --bar island_tabs=alerts,music,system,bluetooth,apps,screens
+./bin/sketchybar --bar island_tabs=alerts,claude,music,system,bluetooth,apps,screens
+
+# Claude only counts as reachable while the company VPN is connected
+# (use the VPN's name from System Settings > VPN)
+./bin/sketchybar --bar claude_check_command="scutil --nc status 'Company VPN' | head -1 | grep -qx Connected"
+
+# Or: reachable only when an internal host answers
+./bin/sketchybar --bar claude_check_url=https://intranet.example.com
 
 # Island never closes by itself
 ./bin/sketchybar --bar island_idle_timeout=0
@@ -150,6 +169,46 @@ Microsoft Outlook
 Slack
 ```
 
+## Claude tab and "done" notifications
+
+**Sessions** lists the Claude Code sessions running on this Mac (CLI and VS
+Code), newest first: name, project folder, where it runs, and "Working" while
+Claude is replying. Click a session to open its folder in VS Code
+(`code <folder>`); ✕ ends that session's process. The list comes from
+`~/.claude/sessions/`, Claude Code's own (undocumented) folder.
+
+**Top models** shows the 10 most used models on
+[OpenRouter's rankings](https://openrouter.ai/rankings) (weekly tokens), with
+provider, context size, max output, price per million tokens (in/out) and
+features. `plugins/claude_models.py` captures them; run it by hand to refresh:
+
+```sh
+python3 plugins/claude_models.py ~/.cache/sketchybar/claude_models.json
+```
+
+**Done notifications**: when a session finishes its reply, a notification
+"*session* is done" with the end of Claude's reply shows up like any other
+(peek + Alerts card), with a happy Clawd instead of an app icon. Clicking it
+opens the project in VS Code. Turn it off per app in the **Apps** tab
+("Claude Code"). It needs this hook in `~/.claude/settings.json`:
+
+```json
+"hooks": {
+  "Stop": [{ "hooks": [{
+    "type": "command",
+    "command": "python3 /path/to/SketchyBar/plugins/claude_hook.py /path/to/SketchyBar/bin/sketchybar",
+    "timeout": 10, "async": true
+  }]}]
+}
+```
+
+Add the same hook under `"Notification"` as well to also get
+"*session* needs you" when Claude waits for an answer.
+
+> Opening in VS Code needs its `code` command: in VS Code run
+> **Shell Command: Install 'code' command in PATH**. Without it, clicks only
+> mark the notification read.
+
 ## Permissions
 
 Grant these in *System Settings › Privacy & Security* to the `sketchybar`
@@ -172,4 +231,8 @@ binary you run.
 | An app is missing from the Apps tab | It shows up once it has sent a notification, or once it's listed in *System Settings › Notifications*. |
 | `[!] Bar: Invalid island_tabs: ...` | A tab name is misspelled. Valid names: `alerts music system bluetooth apps screens` |
 | Icons show as letters | Install FuraCode Nerd Font. |
+| Claude tab always says "currently busy" | `claude_check_url` doesn't answer from this network, or `claude_check_command` exits non-zero. Click the tab to check again. |
+| Claude tab says Claude is reachable while off the VPN | The default URL check only tests the network. Set `claude_check_command` to a VPN check (see [Recipes](#recipes)). |
+| No "done" notifications | Check the Stop hook path in `~/.claude/settings.json` points at your `bin/sketchybar`, and that "Claude Code" is on in the Apps tab. |
+| "Couldn't capture models" | Run `plugins/claude_models.py` by hand to see the error (network, or the rankings page changed). |
 | Screens tab: "Turn on Switch to Desktop shortcuts" | *Keyboard › Keyboard Shortcuts › Mission Control*: enable "Switch to Desktop 1–6". |

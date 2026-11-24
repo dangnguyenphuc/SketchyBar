@@ -51,6 +51,10 @@ struct notification_item {
   char title[128];
   char body[NOTIFICATIONS_TEXT];
   CFAbsoluteTime time;  // delivered (stored ones) or captured (banners)
+  // Added by notifications_add from Claude Code's hook: shown with Clawd
+  // instead of an app icon, and opening it opens `path` in VS Code.
+  bool claude;
+  char path[512];
 };
 
 struct notification_list {
@@ -83,6 +87,10 @@ void notifications_open(int index);
 // Marks it read without opening anything (the card's close button).
 void notifications_dismiss(int index);
 void notifications_read_all(void);
+
+// Adds a notification that didn't come from Notification Center (it is
+// listed like a captured banner; dropped if its app is switched off).
+void notifications_add(const struct notification_item* item);
 
 const struct notification_apps* notifications_apps(void);
 // Switches capturing an app's notifications on or off, and saves it.
