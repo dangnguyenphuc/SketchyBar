@@ -364,6 +364,15 @@ static void bar_island_perform(struct bar* bar, struct island_action* action) {
       island_clamp_scroll(&bar->island, bar_get_island_panel(bar));
       break;
     }
+    case ISLAND_ACTION_SUGGESTION_YES:
+    case ISLAND_ACTION_SUGGESTION_NO: {
+      const struct notification_list* list = notifications_get();
+      if (action->index < 0 || action->index >= list->count) break;
+      struct notification_item item = list->items[action->index];
+      claude_answer(&item, action->type == ISLAND_ACTION_SUGGESTION_YES);
+      island_clamp_scroll(&bar->island, bar_get_island_panel(bar));
+      break;
+    }
     case ISLAND_ACTION_CLAUDE_SUBTAB:
       bar_animate_claude_transition(bar);
       break;
@@ -639,7 +648,10 @@ bool bar_contains_point(struct bar* bar, CGPoint point) {
   return CGRectContainsPoint(frame, point);
 }
 
+static bool bar_peek_click(struct bar* bar, CGPoint point);
+
 bool bar_island_click(struct bar* bar, CGPoint point) {
+  if (bar_peek_click(bar, point)) return true;
   if (!bar_shows_island(bar)) return false;
   bar_island_touch(bar);
   // A service switch resets the scroll position; a still running scroll
@@ -782,9 +794,13 @@ static void bar_get_peek_rects(struct bar* bar, CGRect* icon, CGRect* text) {
   CGFloat center = bar->peek_left + collapsed.width / 2.0;
   CGFloat notch = bar_notch_width(bar);
 
-  *icon = (CGRect){{ center - notch / 2.0 - BAR_PEEK_PADDING - BAR_PEEK_ICON,
-                     bottom + (height - BAR_PEEK_ICON) / 2.0                },
-                   { BAR_PEEK_ICON, BAR_PEEK_ICON }};
+  // A suggestion's Yes / No take the icon's place, as tall as the band.
+  CGFloat icon_width = bar->peek_suggestion ? ISLAND_CHOICES_WIDTH
+                                            : BAR_PEEK_ICON;
+  CGFloat icon_height = bar->peek_suggestion ? height : BAR_PEEK_ICON;
+  *icon = (CGRect){{ center - notch / 2.0 - BAR_PEEK_PADDING - icon_width,
+                     bottom + (height - icon_height) / 2.0              },
+                   { icon_width, icon_height }};
   CGFloat text_x = center + notch / 2.0 + BAR_PEEK_PADDING;
   *text = (CGRect){{ text_x, bottom },
                    { bar->window.frame.size.width - text_x
@@ -828,8 +844,14 @@ void bar_draw(struct bar* bar, bool forced) {
       bar_get_peek_rects(bar, &icon, &text);
       // The icon and text fade in over the last part of the growth.
       double t = bar_progress_fraction(bar->peek_progress);
-      island_draw_peek(bar->window.surface->context, &bar->peek_item,
-                       bar->peek_text, icon, text, (t - 0.6) / 0.4    );
+      if (bar->peek_suggestion) {
+        island_draw_suggestion_peek(bar->window.surface->context,
+                                    &bar->peek_item, icon, text,
+                                    (t - 0.6) / 0.4              );
+      } else {
+        island_draw_peek(bar->window.surface->context, &bar->peek_item,
+                         bar->peek_text, icon, text, (t - 0.6) / 0.4    );
+      }
     }
 
     if (bar_is_horizontal() && bar->expand_progress > 0) {
@@ -1278,6 +1300,8 @@ void bar_island_touch(struct bar* bar) {
 
 void bar_island_settings_changed(void) {
   bar_island_schedule_idle();
+  // A plugin may have been switched: its sources start or stop.
+  bar_island_update_sources();
   for (int i = 0; i < g_bar_manager.bar_count; i++) {
     struct bar* bar = g_bar_manager.bars[i];
     if (bar && bar->expanded)
@@ -1390,6 +1414,7 @@ static void bar_stop_peek(struct bar* bar) {
   if (!bar->peeking && bar->peek_progress == 0) return;
   bar_cancel_peek(bar);
   bar->peeking = false;
+  bar->has_peek_next = false;
   bar->peek_token++;
   bar->peek_progress = 0;
   bar->peek_left = bar->peek_right = 0;
@@ -1401,16 +1426,22 @@ static void bar_stop_peek(struct bar* bar) {
 static void bar_peek(struct bar* bar, const struct notification_item* item) {
   island_open(&bar->island, g_bar_manager.default_item.label.font.family);
   bar->peek_item = *item;
-  CGFloat text = island_peek_text(item, g_bar_manager.notification_peek_chars,
-                                  bar->peek_text, sizeof(bar->peek_text)    );
+  bar->peek_suggestion = claude_suggestion_active(item);
+  CGFloat text = bar->peek_suggestion
+                 ? island_suggestion_text_width(item->suggestion)
+                 : island_peek_text(item,
+                                    g_bar_manager.notification_peek_chars,
+                                    bar->peek_text, sizeof(bar->peek_text));
 
-  // How far past the collapsed shape each side has to reach: the icon left
-  // of the camera, the text right of it (clear of the rounded corner).
+  // How far past the collapsed shape each side has to reach: the icon (or
+  // Yes / No) left of the camera, the text right of it (clear of the
+  // rounded corner).
   CGFloat collapsed = bar_get_shape_size(bar, 0).width;
   CGFloat beside = (collapsed - bar_notch_width(bar)) / 2.0;
   CGFloat corner = g_bar_manager.background.corner_radius / 2.0;
-  bar->peek_left = max(ceil(BAR_PEEK_PADDING * 2 + BAR_PEEK_ICON + corner
-                            - beside), 0);
+  CGFloat left = bar->peek_suggestion ? ISLAND_CHOICES_WIDTH : BAR_PEEK_ICON;
+  bar->peek_left = max(ceil(BAR_PEEK_PADDING * 2 + left + corner - beside),
+                       0                                                   );
   bar->peek_right = max(ceil(BAR_PEEK_PADDING * 2 + text + corner - beside),
                         0                                                  );
 
@@ -1421,16 +1452,72 @@ static void bar_peek(struct bar* bar, const struct notification_item* item) {
 
   uint64_t token = ++bar->peek_token;
   double hold = BAR_PEEK_DURATION / 60.0
-                + g_bar_manager.notification_peek_hold;
+                + (bar->peek_suggestion ? claude_suggest_duration()
+                                        : g_bar_manager.notification_peek_hold);
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, hold * NSEC_PER_SEC),
                  dispatch_get_main_queue(),
                  ^{
     if (!bar_is_alive(bar) || token != bar->peek_token || !bar->peeking)
       return;
+    // A suggestion waited for this peek: it takes over right away.
+    if (bar->has_peek_next) {
+      struct notification_item next = bar->peek_next;
+      bar->has_peek_next = false;
+      if (claude_suggestion_active(&next)) {
+        bar_peek(bar, &next);
+        windows_unfreeze();
+        return;
+      }
+    }
     bar->peeking = false;
     bar_animate_peek(bar);
     windows_unfreeze();
   });
+}
+
+// Claude suggested a next step: it peeks in the closed island of the active
+// display (after a notification still peeking there). In an open island the
+// Alerts card shows it.
+static void bar_island_claude_suggested(const struct notification_item* item) {
+  for (int i = 0; i < g_bar_manager.bar_count; i++) {
+    struct bar* bar = g_bar_manager.bars[i];
+    if (!bar || bar->expanded || bar->expand_progress > 0) continue;
+    if (!bar_is_horizontal() || !bar->shown || bar->hidden
+        || bar->adid != g_bar_manager.active_adid        ) {
+      continue;
+    }
+    if (bar->peeking && !bar->peek_suggestion) {
+      bar->peek_next = *item;
+      bar->has_peek_next = true;
+    } else {
+      bar_peek(bar, item);
+    }
+  }
+  g_bar_manager.bar_needs_update = true;
+  bar_manager_refresh(&g_bar_manager, false);
+  windows_unfreeze();
+}
+
+// A click on a suggestion peek's Yes / No answers it and ends the peek.
+static bool bar_peek_click(struct bar* bar, CGPoint point) {
+  if (bar->expanded || !bar->peeking || !bar->peek_suggestion
+      || bar->peek_progress < BAR_EXPAND_PROGRESS_MAX / 2   ) {
+    return false;
+  }
+  CGRect choices, text, yes, no;
+  bar_get_peek_rects(bar, &choices, &text);
+  island_split_choices(choices, &yes, &no);
+  CGPoint local = bar_get_local_point(bar, point);
+  bool hit_yes = CGRectContainsPoint(CGRectInset(yes, -3, -3), local);
+  bool hit_no = CGRectContainsPoint(CGRectInset(no, -3, -3), local);
+  if (!hit_yes && !hit_no) return false;
+
+  claude_answer(&bar->peek_item, hit_yes);
+  bar->has_peek_next = false;
+  bar->peeking = false;
+  bar->peek_token++;
+  bar_animate_peek(bar);
+  return true;
 }
 
 // Captured notifications changed. A new one (newer than the last peeked)
@@ -1489,6 +1576,7 @@ static void bar_start_stats_history() {
   if (g_stats_timer) return;
   notifications_begin(bar_island_notifications_changed);
   claude_set_callback(bar_island_claude_changed);
+  claude_set_suggest_callback(bar_island_claude_suggested);
 
   // Takes the CPU baseline for the first tick.
   system_stats_sample_load(&g_island_stats);

@@ -39,6 +39,11 @@ enum island_service {
 // says why) for an unknown name or an empty list.
 bool island_set_tabs(const char* list, char* error, size_t size);
 
+// A plugin was switched (--bar plugin_*): tabs whose plugin is off are left
+// out of the column (alerts: notification capture or Claude's notifications;
+// apps: capture; claude: the Claude plugin), the rest keep their order.
+void island_plugins_changed(void);
+
 // A card of the Alerts tab as drawn: the notification (a copy, so it can
 // still be drawn while leaving), its animated position (points from the top
 // of the list), and how far it has appeared (0..1) or left (0..1).
@@ -154,7 +159,9 @@ enum island_action_type {
   ISLAND_ACTION_CLAUDE_OPEN,       // open the session's folder in VS Code
   ISLAND_ACTION_CLAUDE_STOP,       // end the session
   ISLAND_ACTION_CLAUDE_RETRY,      // check reachability again
-  ISLAND_ACTION_CLAUDE_REFRESH     // capture the top models again
+  ISLAND_ACTION_CLAUDE_REFRESH,    // capture the top models again
+  ISLAND_ACTION_SUGGESTION_YES,    // answer a card's suggested next step
+  ISLAND_ACTION_SUGGESTION_NO
 };
 
 struct island_action {
@@ -164,7 +171,8 @@ struct island_action {
                  // SCREEN_SELECT: the desktop; NOTIFICATION_OPEN/DISMISS:
                  // index into the captured notifications; APP_TOGGLE: index
                  // into notifications_apps(); CLAUDE_OPEN/STOP: index into
-                 // claude_get()->sessions
+                 // claude_get()->sessions; SUGGESTION_YES/NO: index into
+                 // the captured notifications
 };
 
 // `family` is the text font family (the bar's default font); NULL uses the
@@ -208,6 +216,23 @@ void island_draw_peek(CGContextRef context,
                       CGRect icon,
                       CGRect text_rect,
                       double alpha                       );
+
+// Suggestion peek (Claude's next step): Yes / No left of the camera, the
+// whole suggestion right of it (one line, or two smaller ones when longer
+// than ISLAND_SUGGEST_LINE). island_suggestion_text_width is the text's
+// width; island_split_choices places the two buttons in their area.
+#define ISLAND_SUGGEST_LINE    380
+#define ISLAND_CHOICE_WIDTH    34
+#define ISLAND_CHOICE_HEIGHT   20
+#define ISLAND_CHOICE_GAP      6
+#define ISLAND_CHOICES_WIDTH   (2 * ISLAND_CHOICE_WIDTH + ISLAND_CHOICE_GAP)
+CGFloat island_suggestion_text_width(const char* text);
+void island_split_choices(CGRect area, CGRect* yes, CGRect* no);
+void island_draw_suggestion_peek(CGContextRef context,
+                                 const struct notification_item* item,
+                                 CGRect choices,
+                                 CGRect text_rect,
+                                 double alpha                        );
 
 // Sprite animations (Clawd): island drawing notes when it drew one that
 // moves. The bar redraws at ISLAND_SPRITE_FPS while that is the case:

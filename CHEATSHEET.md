@@ -9,6 +9,7 @@ else in SketchyBar (items, events, scripting), see the
 - [Build and run](#build-and-run)
 - [Using the island](#using-the-island)
 - [Tabs](#tabs)
+- [Plugins](#plugins)
 - [All settings](#all-settings)
 - [Recipes](#recipes)
 - [Choosing which apps are captured](#choosing-which-apps-are-captured)
@@ -57,6 +58,32 @@ icons evenly over its height, so any number of tabs fits.
 The notch band (the strip beside the camera) always shows the date on the
 left and battery / CPU / RAM on the right.
 
+## Plugins
+
+Each feature of this fork can be switched on or off in `sketchybarrc`
+(`on` / `off`, all `on` by default). A plugin that is off does no
+background work, and its tabs leave the column even if `island_tabs` lists
+them.
+
+```sh
+$BIN_FILE --bar plugin_notifications=on \
+                plugin_claude=on \
+                plugin_claude_notifications=on \
+                plugin_claude_suggestions=on \
+                plugin_claude_models=on
+```
+
+| Plugin | What it does | Off means |
+|---|---|---|
+| `plugin_notifications` | Captures macOS notifications (Notification Center banners and history), the peek for them, the **Apps** tab | No scanning, no Accessibility prompt, **Apps** tab hidden. **Alerts** stays if Claude's notifications are on |
+| `plugin_claude` | Everything Claude: the **Claude** tab and the hook's events | **Claude** tab hidden, hook events ignored. Switches off the three below too |
+| `plugin_claude_notifications` | "*session* is done" / "needs you" notifications | Hook events don't show anything |
+| `plugin_claude_suggestions` | "What next?" with Yes / No after a session finishes | The hook skips the model call entirely (no usage spent) |
+| `plugin_claude_models` | **Top models** subtab and its scraper | Claude tab shows only Sessions, no subtab switch; the scraper never runs |
+
+Music, System, Bluetooth and Screens are plain tabs: leave them out of
+`island_tabs` to remove them (they only do work while shown).
+
 ## All settings
 
 Put any of these after `--bar` in `sketchybarrc`. To try one without saving
@@ -83,6 +110,7 @@ and is lost on restart.
 | `claude_check_interval` | `30` | seconds, min `5` | How often reachability is checked while the tab is open |
 | `claude_models_script` | `plugins/claude_models.py` | path (relative to `sketchybarrc`) | Scraper that captures the top models |
 | `claude_models_file` | `~/.cache/sketchybar/claude_models.json` | path | Where the scraper writes; the tab only shows this file. Re-captured when older than 6 h. |
+| `claude_suggest_duration` | `5` | seconds, min `1` | How long a suggested next step (Yes / No) shows in the closed island before it moves to the Alerts tab |
 
 ### Notch and bar shape
 
@@ -190,17 +218,36 @@ python3 plugins/claude_models.py ~/.cache/sketchybar/claude_models.json
 "*session* is done" with the end of Claude's reply shows up like any other
 (peek + Alerts card), with a happy Clawd instead of an app icon. Clicking it
 opens the project in VS Code. Turn it off per app in the **Apps** tab
-("Claude Code"). It needs this hook in `~/.claude/settings.json`:
+("Claude Code").
+
+**What next?** Right after that, the hook asks Haiku (`claude -p`, a few
+seconds, a small amount of your usage) for the step you most likely want
+next. It shows in the closed island for `claude_suggest_duration` seconds:
+**Yes / No** left of the camera, the whole suggestion right of it.
+
+| You | Result |
+|---|---|
+| **Yes** | Claude does it in the same session right away (the hook wakes it) |
+| **No** | Dismissed |
+| Nothing for 5 s | It moves into the Alerts tab as a card with Yes / No, answerable for 10 minutes |
+| Type a new prompt in that session | The suggestion expires (the card turns back into a plain "done" one) |
+
+Both need this hook in `~/.claude/settings.json` (`asyncRewake` lets it wait
+for your answer in the background and wake Claude on Yes):
 
 ```json
 "hooks": {
   "Stop": [{ "hooks": [{
     "type": "command",
     "command": "python3 /path/to/SketchyBar/plugins/claude_hook.py /path/to/SketchyBar/bin/sketchybar",
-    "timeout": 10, "async": true
+    "timeout": 900, "asyncRewake": true
   }]}]
 }
 ```
+
+Hook options, after the binary: `--no-suggest` (done notifications only),
+`--model sonnet` (another model for suggestions), `--wait 300` (how long a
+suggestion stays answerable, seconds).
 
 Add the same hook under `"Notification"` as well to also get
 "*session* needs you" when Claude waits for an answer.
@@ -234,5 +281,6 @@ binary you run.
 | Claude tab always says "currently busy" | `claude_check_url` doesn't answer from this network, or `claude_check_command` exits non-zero. Click the tab to check again. |
 | Claude tab says Claude is reachable while off the VPN | The default URL check only tests the network. Set `claude_check_command` to a VPN check (see [Recipes](#recipes)). |
 | No "done" notifications | Check the Stop hook path in `~/.claude/settings.json` points at your `bin/sketchybar`, and that "Claude Code" is on in the Apps tab. |
+| No "What next?" after a done notification | Run `claude -p hi --model haiku` in a terminal: it must work without a login prompt. Haiku can also answer that nothing is left to do. |
 | "Couldn't capture models" | Run `plugins/claude_models.py` by hand to see the error (network, or the rankings page changed). |
 | Screens tab: "Turn on Switch to Desktop shortcuts" | *Keyboard › Keyboard Shortcuts › Mission Control*: enable "Switch to Desktop 1–6". |

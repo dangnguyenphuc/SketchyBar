@@ -68,25 +68,33 @@ static void handle_domain_subscribe(FILE* rsp, struct token domain, char* messag
 //                     cwd=<folder> message=<text>
 // Sent by Claude Code's hook (plugins/claude_hook.py).
 static void handle_domain_claude(FILE* rsp, char* message) {
-  const char *event = NULL, *session = NULL, *name = NULL, *cwd = NULL,
-             *text = NULL;
+  struct claude_event event = { 0 };
   struct token token = get_token(&message);
   while (token.text && token.length > 0) {
     struct key_value_pair pair = get_key_value_pair(token.text, '=');
     if (pair.key) {
-      if (strcmp(pair.key, "event") == 0) event = pair.value;
-      else if (strcmp(pair.key, "session") == 0) session = pair.value;
-      else if (strcmp(pair.key, "name") == 0) name = pair.value;
-      else if (strcmp(pair.key, "cwd") == 0) cwd = pair.value;
-      else if (strcmp(pair.key, "message") == 0) text = pair.value;
+      if (strcmp(pair.key, "event") == 0) event.event = pair.value;
+      else if (strcmp(pair.key, "token") == 0) event.token = pair.value;
+      else if (strcmp(pair.key, "session") == 0) event.session = pair.value;
+      else if (strcmp(pair.key, "name") == 0) event.name = pair.value;
+      else if (strcmp(pair.key, "cwd") == 0) event.cwd = pair.value;
+      else if (strcmp(pair.key, "message") == 0) event.message = pair.value;
+      else if (strcmp(pair.key, "suggestion") == 0)
+        event.suggestion = pair.value;
     }
     token = get_token(&message);
   }
-  if (!event) {
-    respond(rsp, "[!] Claude: Expected event=<stop|attention>\n");
+  if (!event.event) {
+    respond(rsp, "[!] Claude: Expected "
+                 "event=<stop|attention|suggest|expire>\n");
     return;
   }
-  claude_handle_event(event, session, name, cwd, text);
+  claude_handle_event(&event);
+  // Tells the hook whether a suggestion is wanted before it asks a model.
+  if (strcmp(event.event, "stop") == 0) {
+    respond(rsp, "suggestions=%s\n",
+            claude_plugin(CLAUDE_PLUGIN_SUGGESTIONS) ? "on" : "off");
+  }
 }
 
 static void handle_domain_trigger(FILE* rsp, struct token domain, char* message) {
@@ -445,6 +453,35 @@ static bool handle_domain_bar(FILE *rsp, struct token domain, char *message) {
     char* path = token_to_string(get_token(&message));
     claude_set_models_script(path);
     free(path);
+  } else if (token_equals(command, PROPERTY_PLUGIN_NOTIFICATIONS)) {
+    struct token state = get_token(&message);
+    notifications_set_capture(evaluate_boolean_state(state,
+                                                     notifications_capture()));
+    island_plugins_changed();
+    bar_island_settings_changed();
+    needs_refresh = true;
+  } else if (token_equals(command, PROPERTY_PLUGIN_CLAUDE)
+             || token_equals(command, PROPERTY_PLUGIN_CLAUDE_NOTIFICATIONS)
+             || token_equals(command, PROPERTY_PLUGIN_CLAUDE_SUGGESTIONS)
+             || token_equals(command, PROPERTY_PLUGIN_CLAUDE_MODELS)        ) {
+    int plugin = token_equals(command, PROPERTY_PLUGIN_CLAUDE)
+                 ? CLAUDE_PLUGIN
+                 : token_equals(command, PROPERTY_PLUGIN_CLAUDE_NOTIFICATIONS)
+                   ? CLAUDE_PLUGIN_NOTIFICATIONS
+                   : token_equals(command, PROPERTY_PLUGIN_CLAUDE_SUGGESTIONS)
+                     ? CLAUDE_PLUGIN_SUGGESTIONS
+                     : CLAUDE_PLUGIN_MODELS;
+    // The switch itself, not combined with the main Claude plugin.
+    bool current = plugin == CLAUDE_PLUGIN
+                   ? claude_plugin(CLAUDE_PLUGIN)
+                   : claude_plugin_switch(plugin);
+    claude_set_plugin(plugin, evaluate_boolean_state(get_token(&message),
+                                                     current            ));
+    island_plugins_changed();
+    bar_island_settings_changed();
+    needs_refresh = true;
+  } else if (token_equals(command, PROPERTY_CLAUDE_SUGGEST_DURATION)) {
+    claude_set_suggest_duration(token_to_float(get_token(&message)));
   } else if (token_equals(command, PROPERTY_CLAUDE_MODELS_FILE)) {
     char* path = token_to_string(get_token(&message));
     claude_set_models_file(path);

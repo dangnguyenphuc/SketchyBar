@@ -55,6 +55,11 @@ struct notification_item {
   // instead of an app icon, and opening it opens `path` in VS Code.
   bool claude;
   char path[512];
+  // Claude's suggested next step (empty: none), answerable with Yes / No
+  // until `suggest_until`. `token` names the hook waiting for the answer.
+  char token[48];
+  char suggestion[192];
+  CFAbsoluteTime suggest_until;
 };
 
 struct notification_list {
@@ -92,9 +97,28 @@ void notifications_read_all(void);
 // listed like a captured banner; dropped if its app is switched off).
 void notifications_add(const struct notification_item* item);
 
+// Attaches a suggested next step to the added notification `id` (it is
+// listed as unread again if it was read). Copies the updated notification
+// to `out`; false if `id` isn't known.
+bool notifications_set_suggestion(const char* id,
+                                  const char* suggestion,
+                                  CFAbsoluteTime until,
+                                  struct notification_item* out);
+// The suggestion can't be answered anymore: the notification shows as a
+// plain one again.
+void notifications_clear_suggestion(const char* id);
+// Marks the notification `id` read (wherever it is in the list).
+void notifications_dismiss_id(const char* id);
+
 const struct notification_apps* notifications_apps(void);
 // Switches capturing an app's notifications on or off, and saves it.
 void notifications_set_app_enabled(int index, bool enabled);
+
+// The capture plugin (--bar plugin_notifications): while off nothing is
+// scanned (no Accessibility prompt either) and only added notifications
+// (Claude's) are listed. On by default.
+void notifications_set_capture(bool on);
+bool notifications_capture(void);
 
 // Settings. How often banners and Notification Center's database are checked
 // (seconds, NOTIFICATIONS_SCAN_MIN..MAX; banners stay ~5s, so keep it below

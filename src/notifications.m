@@ -42,6 +42,8 @@ static AXUIElementRef g_center = NULL;
 static pid_t g_center_pid = 0;
 static dispatch_source_t g_timer = NULL;
 
+static bool g_capture = true;
+static bool g_prompted = false;
 static double g_scan_interval = NOTIFICATIONS_SCAN_DEFAULT;
 static int g_per_app = NOTIFICATIONS_PER_APP_DEFAULT;
 
@@ -564,6 +566,7 @@ static void scan_database() {
 
     dispatch_async(dispatch_get_main_queue(), ^{
       g_database_reading = false;
+      if (!g_capture) return;  // switched off meanwhile
       if (!access) {
         g_database_retry = CFAbsoluteTimeGetCurrent() + DATABASE_RETRY;
         g_stored_count = 0;
@@ -611,6 +614,14 @@ static void attach() {
 // Center's database if it changed, and the apps (ncprefs, apps file) if they
 // changed.
 static void tick() {
+  if (!g_capture) return;
+  // Asks for Accessibility once, the first time capturing actually runs.
+  if (!g_prompted) {
+    g_prompted = true;
+    NSDictionary* options = @{ (id)kAXTrustedCheckOptionPrompt: @YES };
+    g_list.trusted = AXIsProcessTrustedWithOptions((CFDictionaryRef)options);
+  }
+
   bool apps = load_ncprefs();
   if (load_disabled()) apps = true;
   if (apps) rebuild();
@@ -652,18 +663,40 @@ void notifications_begin(notifications_callback* on_change) {
   g_database_queue = dispatch_queue_create("sketchybar.notifications",
                                            DISPATCH_QUEUE_SERIAL      );
 
-  // Shows the Accessibility prompt once if access is missing.
-  NSDictionary* options = @{ (id)kAXTrustedCheckOptionPrompt: @YES };
-  g_list.trusted = AXIsProcessTrustedWithOptions((CFDictionaryRef)options);
-
   g_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                                    dispatch_get_main_queue()       );
   schedule_timer();
   dispatch_source_set_event_handler(g_timer, ^{ @autoreleasepool { tick(); } });
   dispatch_resume(g_timer);
-  // The first scan runs once the caller is done: it reports the apps right
-  // away, and the callback must not run while the bar is still being built.
-  dispatch_async(dispatch_get_main_queue(), ^{ @autoreleasepool { tick(); } });
+  // The first scan runs a moment later: the callback must not run while the
+  // bar is still being built, and the config (which may switch capturing
+  // off) runs right after startup.
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
+                 dispatch_get_main_queue(),
+                 ^{ @autoreleasepool { tick(); } });
+}
+
+void notifications_set_capture(bool on) {
+  if (on == g_capture) return;
+  g_capture = on;
+  if (on) {
+    if (g_seen) @autoreleasepool { tick(); }
+    return;
+  }
+  // Drop what was captured; added (Claude) notifications stay.
+  int kept = 0;
+  for (int i = 0; i < g_banner_count; i++) {
+    if (g_banners[i].claude) g_banners[kept++] = g_banners[i];
+  }
+  g_banner_count = kept;
+  g_stored_count = 0;
+  g_list.history = false;
+  detach();
+  if (g_seen) rebuild();
+}
+
+bool notifications_capture(void) {
+  return g_capture;
 }
 
 const struct notification_list* notifications_get(void) {
@@ -730,6 +763,44 @@ void notifications_add(const struct notification_item* item) {
             keep * sizeof(struct notification_item));
     g_banner_count = keep + 1;
     g_banners[0] = *item;
+  }
+  rebuild();
+}
+
+static struct notification_item* find_banner(const char* id) {
+  for (int i = 0; i < g_banner_count; i++) {
+    if (strcmp(g_banners[i].id, id) == 0) return &g_banners[i];
+  }
+  return NULL;
+}
+
+bool notifications_set_suggestion(const char* id,
+                                  const char* suggestion,
+                                  CFAbsoluteTime until,
+                                  struct notification_item* out) {
+  struct notification_item* item = find_banner(id);
+  if (!item) return false;
+  snprintf(item->suggestion, sizeof(item->suggestion), "%s", suggestion);
+  item->suggest_until = until;
+  @autoreleasepool {
+    [g_read removeObject:@(id)];
+  }
+  if (out) *out = *item;
+  rebuild();
+  return true;
+}
+
+void notifications_clear_suggestion(const char* id) {
+  struct notification_item* item = find_banner(id);
+  if (!item || !item->suggestion[0]) return;
+  item->suggestion[0] = '\0';
+  item->suggest_until = 0;
+  rebuild();
+}
+
+void notifications_dismiss_id(const char* id) {
+  @autoreleasepool {
+    remember(g_read, @(id));
   }
   rebuild();
 }

@@ -15,6 +15,15 @@ BIN_FILE="/Users/lap14962/workspace/my-project/SketchyBar/bin/sketchybar"
 
 $BIN_FILE --bar position=top height=38 color=0xff000000 corner_radius=20 topmost=window
 
+##### Island Plugins (on/off) #####
+# A plugin that is off does no work and its tabs leave the island.
+# See CHEATSHEET.md > Plugins.
+$BIN_FILE --bar plugin_notifications=on \
+                plugin_claude=on \
+                plugin_claude_notifications=on \
+                plugin_claude_suggestions=on \
+                plugin_claude_models=on
+
 ##### Changing Defaults #####
 # We now change some default values, which are applied to all further items.
 # For a full list of all available item properties see:

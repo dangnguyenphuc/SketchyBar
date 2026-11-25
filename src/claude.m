@@ -1,5 +1,4 @@
 #include "claude.h"
-#include "notifications.h"
 #import <Foundation/Foundation.h>
 #include <signal.h>
 #include <spawn.h>
@@ -10,6 +9,9 @@ extern char g_config_file[4096];
 
 static struct claude_state g_state = { .reachability = CLAUDE_CHECKING };
 static claude_callback* g_callback = NULL;
+static claude_suggest_callback* g_suggest_callback = NULL;
+static double g_suggest_duration = CLAUDE_SUGGEST_DURATION_DEFAULT;
+static bool g_plugins[CLAUDE_PLUGIN_COUNT] = { true, true, true, true };
 
 static bool g_watching = false;
 static dispatch_source_t g_sessions_timer = NULL;
@@ -349,7 +351,7 @@ static void update_models(bool force) {
 }
 
 void claude_refresh_models(void) {
-  update_models(true);
+  if (claude_plugin(CLAUDE_PLUGIN_MODELS)) update_models(true);
 }
 
 // ------------------------------------------------------------ watching
@@ -375,6 +377,7 @@ static void stop_timer(dispatch_source_t* timer) {
 }
 
 void claude_watch(bool on) {
+  if (!claude_plugin(CLAUDE_PLUGIN)) on = false;
   if (on == g_watching) return;
   g_watching = on;
   if (!on) {
@@ -385,43 +388,126 @@ void claude_watch(bool on) {
 
   read_sessions();
   claude_check_now();
-  update_models(false);
+  if (claude_plugin(CLAUDE_PLUGIN_MODELS)) update_models(false);
   g_sessions_timer = start_timer(CLAUDE_SESSIONS_POLL, ^{ read_sessions(); });
   g_check_timer = start_timer(g_check_interval, ^{ claude_check_now(); });
 }
 
 // ------------------------------------------------------------ hook events
 
-void claude_handle_event(const char* event,
-                         const char* session,
-                         const char* name,
-                         const char* cwd,
-                         const char* message) {
-  bool attention = event && strcmp(event, "attention") == 0;
-  if (!attention && !(event && strcmp(event, "stop") == 0)) return;
+static void claude_notification_id(const char* token, char* out, size_t size) {
+  snprintf(out, size, "claude-%s", token ? token : "");
+}
+
+void claude_handle_event(const struct claude_event* event) {
+  if (!event->event || !claude_plugin(CLAUDE_PLUGIN)) return;
+  bool stop = strcmp(event->event, "stop") == 0;
+  bool attention = strcmp(event->event, "attention") == 0;
+
+  if (strcmp(event->event, "suggest") == 0) {
+    if (!claude_plugin(CLAUDE_PLUGIN_SUGGESTIONS)) return;
+    if (!event->token || !event->suggestion || !event->suggestion[0]) return;
+    char id[64];
+    claude_notification_id(event->token, id, sizeof(id));
+    struct notification_item item;
+    if (notifications_set_suggestion(id, event->suggestion,
+                                     CFAbsoluteTimeGetCurrent()
+                                     + CLAUDE_SUGGEST_WAIT,
+                                     &item                       )
+        && g_suggest_callback) {
+      g_suggest_callback(&item);
+    }
+    return;
+  }
+  if (strcmp(event->event, "expire") == 0) {
+    if (!event->token) return;
+    char id[64];
+    claude_notification_id(event->token, id, sizeof(id));
+    notifications_clear_suggestion(id);
+    return;
+  }
+  if (!stop && !attention) return;
+  if (!claude_plugin(CLAUDE_PLUGIN_NOTIFICATIONS)) return;
 
   struct notification_item item;
   memset(&item, 0, sizeof(item));
   item.claude = true;
   item.time = CFAbsoluteTimeGetCurrent();
   snprintf(item.app, sizeof(item.app), "%s", CLAUDE_APP_NAME);
-  snprintf(item.path, sizeof(item.path), "%s", cwd ? cwd : "");
-  snprintf(item.id, sizeof(item.id), "claude-%.24s-%.0f",
-           session ? session : "", item.time * 1000);
+  snprintf(item.path, sizeof(item.path), "%s", event->cwd ? event->cwd : "");
+  if (event->token && event->token[0]) {
+    snprintf(item.token, sizeof(item.token), "%s", event->token);
+    claude_notification_id(event->token, item.id, sizeof(item.id));
+  } else {
+    snprintf(item.id, sizeof(item.id), "claude-%.24s-%.0f",
+             event->session ? event->session : "", item.time * 1000);
+  }
 
-  const char* project = cwd ? strrchr(cwd, '/') : NULL;
-  project = project && project[1] ? project + 1 : (cwd ? cwd : "");
-  const char* label = name && name[0] ? name : project;
+  const char* cwd = event->cwd ? event->cwd : "";
+  const char* project = strrchr(cwd, '/');
+  project = project && project[1] ? project + 1 : cwd;
+  const char* label = event->name && event->name[0] ? event->name : project;
   snprintf(item.title, sizeof(item.title),
            attention ? "%s needs you" : "%s is done", label[0] ? label
                                                                : "Claude");
-  if (message && message[0])
-    snprintf(item.body, sizeof(item.body), "%s", message);
-  else
-    snprintf(item.body, sizeof(item.body), "%s", project);
+  snprintf(item.body, sizeof(item.body), "%s",
+           event->message && event->message[0] ? event->message : project);
 
   notifications_add(&item);
   if (g_watching) read_sessions();
+}
+
+bool claude_suggestion_active(const struct notification_item* item) {
+  return item->claude && item->suggestion[0]
+         && CFAbsoluteTimeGetCurrent() < item->suggest_until;
+}
+
+void claude_answer(const struct notification_item* item, bool yes) {
+  if (item->token[0] && claude_suggestion_active(item)) {
+    @autoreleasepool {
+      NSString* folder = [@CLAUDE_ANSWERS stringByExpandingTildeInPath];
+      [[NSFileManager defaultManager] createDirectoryAtPath:folder
+                                withIntermediateDirectories:YES
+                                                 attributes:nil
+                                                      error:NULL];
+      NSString* path = [folder stringByAppendingPathComponent:
+                         @(item->token)];
+      [(yes ? @"yes" : @"no") writeToFile:path atomically:YES
+                                 encoding:NSUTF8StringEncoding error:NULL];
+    }
+  }
+  notifications_dismiss_id(item->id);
+}
+
+void claude_set_plugin(int plugin, bool on) {
+  if (plugin < 0 || plugin >= CLAUDE_PLUGIN_COUNT) return;
+  if (g_plugins[plugin] == on) return;
+  g_plugins[plugin] = on;
+  if (plugin == CLAUDE_PLUGIN && !on) claude_watch(false);
+  if (plugin == CLAUDE_PLUGIN_MODELS && on && g_watching) update_models(false);
+  notify();
+}
+
+bool claude_plugin_switch(int plugin) {
+  if (plugin < 0 || plugin >= CLAUDE_PLUGIN_COUNT) return false;
+  return g_plugins[plugin];
+}
+
+bool claude_plugin(int plugin) {
+  if (plugin < 0 || plugin >= CLAUDE_PLUGIN_COUNT) return false;
+  return g_plugins[plugin] && g_plugins[CLAUDE_PLUGIN];
+}
+
+void claude_set_suggest_callback(claude_suggest_callback* on_suggest) {
+  g_suggest_callback = on_suggest;
+}
+
+double claude_suggest_duration(void) {
+  return g_suggest_duration;
+}
+
+void claude_set_suggest_duration(double seconds) {
+  g_suggest_duration = max(seconds, 1.0);
 }
 
 // ------------------------------------------------------------ public

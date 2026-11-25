@@ -94,6 +94,13 @@ struct bar {
   uint64_t peek_token;
   struct notification_item peek_item;
   char peek_text[256];
+  // The peek shows Claude's suggested next step (Yes / No left of the
+  // camera, the suggestion right of it) for claude_suggest_duration seconds.
+  // One that arrives while another notification peeks waits in
+  // `peek_next` until that one's hold ends.
+  bool peek_suggestion;
+  bool has_peek_next;
+  struct notification_item peek_next;
   uint64_t scroll_glide_time;
   uint64_t cards_time;
   CFAbsoluteTime island_activity;

@@ -14,6 +14,10 @@
 #define ISLAND_SCROLL_GAP     5
 #define ISLAND_SCROLL_MIN     14
 #define ISLAND_CARD_HEIGHT    46
+// A card with Claude's suggested next step: Yes / No stacked on the left,
+// up to three lines of the suggestion.
+#define ISLAND_SUGGEST_CARD   60
+#define ISLAND_SUGGEST_LINES  3
 #define ISLAND_CARD_GAP       6
 #define ISLAND_CARD_RADIUS    10
 #define ISLAND_CARD_INSET     9
@@ -145,7 +149,15 @@ static const struct {
   [ISLAND_SERVICE_CLAUDE]    = { "claude",    NULL,           "C" },
 };
 
-// The column's tabs, top to bottom (see island_set_tabs).
+// The tabs as configured (see island_set_tabs), and the ones the column
+// shows: those whose plugin is on (see island_plugins_changed).
+static int g_configured[ISLAND_SERVICE_COUNT] = { ISLAND_SERVICE_ALERTS,
+                                                  ISLAND_SERVICE_CLAUDE,
+                                                  ISLAND_SERVICE_MUSIC,
+                                                  ISLAND_SERVICE_SYSTEM,
+                                                  ISLAND_SERVICE_BLUETOOTH,
+                                                  ISLAND_SERVICE_APPS       };
+static int g_configured_count = 6;
 static int g_tabs[ISLAND_SERVICE_COUNT] = { ISLAND_SERVICE_ALERTS,
                                             ISLAND_SERVICE_CLAUDE,
                                             ISLAND_SERVICE_MUSIC,
@@ -153,6 +165,33 @@ static int g_tabs[ISLAND_SERVICE_COUNT] = { ISLAND_SERVICE_ALERTS,
                                             ISLAND_SERVICE_BLUETOOTH,
                                             ISLAND_SERVICE_APPS       };
 static int g_tab_count = 6;
+
+static bool island_service_enabled(int service) {
+  switch (service) {
+    case ISLAND_SERVICE_ALERTS:
+      return notifications_capture()
+             || claude_plugin(CLAUDE_PLUGIN_NOTIFICATIONS);
+    case ISLAND_SERVICE_APPS:
+      return notifications_capture();
+    case ISLAND_SERVICE_CLAUDE:
+      return claude_plugin(CLAUDE_PLUGIN);
+    default:
+      return true;
+  }
+}
+
+void island_plugins_changed(void) {
+  g_tab_count = 0;
+  for (int i = 0; i < g_configured_count; i++) {
+    if (island_service_enabled(g_configured[i]))
+      g_tabs[g_tab_count++] = g_configured[i];
+  }
+  // Every configured tab switched off: show them anyway rather than nothing.
+  if (g_tab_count == 0) {
+    memcpy(g_tabs, g_configured, g_configured_count * sizeof(int));
+    g_tab_count = g_configured_count;
+  }
+}
 
 bool island_set_tabs(const char* list, char* error, size_t size) {
   int tabs[ISLAND_SERVICE_COUNT];
@@ -186,8 +225,9 @@ bool island_set_tabs(const char* list, char* error, size_t size) {
     return false;
   }
 
-  memcpy(g_tabs, tabs, count * sizeof(int));
-  g_tab_count = count;
+  memcpy(g_configured, tabs, count * sizeof(int));
+  g_configured_count = count;
+  island_plugins_changed();
   return true;
 }
 
@@ -224,6 +264,8 @@ static struct {
   CTFontRef app_glyph;   // notification cards: app icon glyph
   CTFontRef app_letter;  // ... or letter
   CTFontRef peek;        // peek text in the closed island
+  CTFontRef peek_small;  // ... when it takes two lines
+  CTFontRef button;      // Yes / No
 } g_fonts;
 
 // Music tab glyphs (Font Awesome in the Nerd Font), letters without it.
@@ -407,6 +449,9 @@ void island_open(struct island* island, const char* family) {
   g_fonts.app_letter = island_create_font(family, "Bold",
                                           ISLAND_APP_LETTER_SIZE);
   g_fonts.peek = island_create_font(family, "Regular", ISLAND_PEEK_FONT);
+  g_fonts.peek_small = island_create_font(family, "Regular",
+                                          ISLAND_PEEK_FONT - 1);
+  g_fonts.button = island_create_font(family, "Bold", 10);
   island_pick_stat_glyphs();
   island_pick_media_glyphs();
   island_pick_app_icon_marks();
@@ -421,7 +466,8 @@ void island_release(void) {
                          &g_fonts.icon, &g_fonts.stats,
                          &g_fonts.stats_icon, &g_fonts.small_icon,
                          &g_fonts.screen_icon, &g_fonts.app_glyph,
-                         &g_fonts.app_letter, &g_fonts.peek              };
+                         &g_fonts.app_letter, &g_fonts.peek,
+                         &g_fonts.peek_small, &g_fonts.button            };
 
   for (int i = 0; i < sizeof(fonts) / sizeof(fonts[0]); i++) {
     if (*fonts[i]) CFRelease(*fonts[i]);
@@ -512,10 +558,19 @@ static CGRect island_alerts_list(struct island_layout* layout) {
   return list;
 }
 
+// Cards are taller while they hold a suggestion that can be answered.
+static CGFloat island_card_height(const struct notification_item* item) {
+  return claude_suggestion_active(item) ? ISLAND_SUGGEST_CARD
+                                        : ISLAND_CARD_HEIGHT;
+}
+
 static CGFloat island_list_height() {
-  int count = notifications_get()->count;
-  if (count == 0) return 0;
-  return count * ISLAND_CARD_HEIGHT + (count - 1) * ISLAND_CARD_GAP;
+  const struct notification_list* list = notifications_get();
+  if (list->count == 0) return 0;
+  CGFloat height = (list->count - 1) * ISLAND_CARD_GAP;
+  for (int i = 0; i < list->count; i++)
+    height += island_card_height(&list->items[i]);
+  return height;
 }
 
 static CGFloat island_max_scroll(struct island_layout* layout) {
@@ -1102,6 +1157,116 @@ static void island_draw_app_icon(CGContextRef context,
                     ISLAND_COLOR_WHITE, 1.0, rect             );
 }
 
+// ---------------------------------------------------------------- wrapping
+
+// Breaks `text` into at most `max_lines` lines no wider than `width` in
+// `font`; if text is left over, the last line ends in an ellipsis. Returns
+// the number of lines (each must be released).
+static int island_wrap_text(const char* text,
+                            CTFontRef font,
+                            CGFloat width,
+                            int max_lines,
+                            CTLineRef* lines  ) {
+  if (!text || !font || width <= 0) return 0;
+  CFStringRef string = CFStringCreateWithCString(NULL, text,
+                                                 kCFStringEncodingUTF8);
+  if (!string) return 0;
+  const void* keys[] = { kCTFontAttributeName,
+                         kCTForegroundColorFromContextAttributeName };
+  const void* values[] = { font, kCFBooleanTrue };
+  CFDictionaryRef attributes = CFDictionaryCreate(NULL, keys, values, 2,
+                                         &kCFTypeDictionaryKeyCallBacks,
+                                         &kCFTypeDictionaryValueCallBacks);
+  CFAttributedStringRef attributed = CFAttributedStringCreate(NULL, string,
+                                                              attributes  );
+  CTTypesetterRef typesetter = CTTypesetterCreateWithAttributedString(
+                                                                attributed);
+  CFIndex length = CFStringGetLength(string);
+  CFIndex start = 0;
+  int count = 0;
+  while (start < length && count < max_lines) {
+    CFIndex fits = CTTypesetterSuggestLineBreak(typesetter, start, width);
+    if (fits <= 0) break;
+    if (count == max_lines - 1 && start + fits < length) {
+      CTLineRef rest = CTTypesetterCreateLine(typesetter,
+                                              CFRangeMake(start,
+                                                          length - start));
+      CFAttributedStringRef dots = CFAttributedStringCreate(NULL,
+                                                            CFSTR("…"),
+                                                            attributes  );
+      CTLineRef ellipsis = CTLineCreateWithAttributedString(dots);
+      CTLineRef cut = CTLineCreateTruncatedLine(rest, width,
+                                                kCTLineTruncationEnd,
+                                                ellipsis             );
+      if (cut) {
+        CFRelease(rest);
+        rest = cut;
+      }
+      lines[count++] = rest;
+      CFRelease(ellipsis);
+      CFRelease(dots);
+      break;
+    }
+    lines[count++] = CTTypesetterCreateLine(typesetter,
+                                            CFRangeMake(start, fits));
+    start += fits;
+  }
+  CFRelease(typesetter);
+  CFRelease(attributed);
+  CFRelease(attributes);
+  CFRelease(string);
+  return count;
+}
+
+// Draws (and releases) wrapped lines, the first baseline at `baseline`.
+static void island_draw_lines(CGContextRef context,
+                              CTLineRef* lines,
+                              int count,
+                              uint32_t color,
+                              CGFloat alpha,
+                              CGFloat x,
+                              CGFloat baseline,
+                              CGFloat spacing   ) {
+  island_set_fill(context, color, alpha);
+  for (int i = 0; i < count; i++) {
+    CGContextSetTextMatrix(context, CGAffineTransformIdentity);
+    CGContextSetTextPosition(context, x, baseline - i * spacing);
+    CTLineDraw(lines[i], context);
+    CFRelease(lines[i]);
+  }
+}
+
+// A Yes (green, the default) or No (glass) button.
+static void island_draw_choice(CGContextRef context,
+                               CGRect rect,
+                               bool yes,
+                               CGFloat alpha  ) {
+  CGFloat radius = rect.size.height / 2.0;
+  if (yes) {
+    island_add_rounded_rect(context, rect, radius);
+    island_set_fill(context, ISLAND_COLOR_GREEN, 0.9 * alpha);
+    CGContextFillPath(context);
+  } else {
+    island_draw_glass(context, rect, radius, 1.4);
+  }
+  CGFloat baseline = CGRectGetMidY(rect)
+                     - (CTFontGetAscent(g_fonts.button)
+                        - CTFontGetDescent(g_fonts.button)) / 2.0;
+  island_draw_text_colored(context, yes ? "Yes" : "No", g_fonts.button,
+                           yes ? 0xff10200a : ISLAND_COLOR_WHITE,
+                           0.95 * alpha, CGRectGetMidX(rect), baseline,
+                           rect.size.width, ALIGN_CENTER               );
+}
+
+// A suggestion card's Yes / No, stacked in its left column.
+static void island_card_choices(CGRect card, CGRect* yes, CGRect* no) {
+  CGFloat x = card.origin.x + ISLAND_CARD_INSET;
+  CGFloat mid = CGRectGetMidY(card);
+  CGFloat height = ISLAND_CHOICE_HEIGHT - 2;
+  *yes = (CGRect){{ x, mid + 2 }, { ISLAND_CHOICE_WIDTH, height }};
+  *no = (CGRect){{ x, mid - 2 - height }, { ISLAND_CHOICE_WIDTH, height }};
+}
+
 // The card's close button (top right): marks it read without opening it.
 static CGRect island_card_close_rect(CGRect card) {
   return (CGRect){{ CGRectGetMaxX(card) - ISLAND_CARD_INSET + 3
@@ -1119,6 +1284,43 @@ static void island_draw_card(CGContextRef context,
   island_set_fill(context, 0xff000000, 1.0);
   CGContextFillPath(context);
   island_draw_glass(context, card, ISLAND_CARD_RADIUS, 1.0);
+
+  if (claude_suggestion_active(notification)) {
+    // Yes / No on the left; header (what finished, when) and the whole
+    // suggestion right of them.
+    CGRect yes, no;
+    island_card_choices(card, &yes, &no);
+    island_draw_choice(context, yes, true, 1.0);
+    island_draw_choice(context, no, false, 1.0);
+
+    CGFloat x = CGRectGetMaxX(yes) + ISLAND_APP_ICON_GAP;
+    CGFloat right = CGRectGetMaxX(card) - ISLAND_CARD_INSET;
+    CGFloat top = CGRectGetMaxY(card);
+    CGRect close = island_card_close_rect(card);
+    island_draw_glass(context, close, close.size.width / 2.0, 1.3);
+    island_draw_glyph(context, g_glyphs[GLYPH_CROSS], g_fonts.stats_icon,
+                      ISLAND_COLOR_WHITE, 0.8, close                     );
+
+    char time[16];
+    island_relative_time(notification->time, time, sizeof(time));
+    CGFloat time_right = close.origin.x - 5;
+    CGFloat time_width = island_draw_text(context, time, g_fonts.caption,
+                                          0.5, time_right, top - 13,
+                                          time_right - x, ALIGN_RIGHT  );
+    char header[160];
+    snprintf(header, sizeof(header), "%s · next?", notification->title);
+    island_draw_text_colored(context, header, g_fonts.caption,
+                             ISLAND_COLOR_CLAUDE, 0.9,
+                             x, top - 13, time_right - x - time_width - 6,
+                             ALIGN_LEFT                                   );
+
+    CTLineRef lines[ISLAND_SUGGEST_LINES];
+    int count = island_wrap_text(notification->suggestion, g_fonts.body,
+                                 right - x, ISLAND_SUGGEST_LINES, lines);
+    island_draw_lines(context, lines, count, ISLAND_COLOR_WHITE, 0.92,
+                      x, top - 27, 12                                 );
+    return;
+  }
 
   // App icon on the left, the texts right of it.
   CGRect icon = {{ card.origin.x + ISLAND_CARD_INSET,
@@ -1206,8 +1408,13 @@ static void island_draw_placeholder(CGContextRef context,
 
 // ---------------------------------------------------------------- cards
 
+// How far below the list's top the card of notification `index` sits.
 static CGFloat island_card_target(int index) {
-  return index * (ISLAND_CARD_HEIGHT + ISLAND_CARD_GAP);
+  const struct notification_list* list = notifications_get();
+  CGFloat y = 0;
+  for (int i = 0; i < index && i < list->count; i++)
+    y += island_card_height(&list->items[i]) + ISLAND_CARD_GAP;
+  return y;
 }
 
 static int island_notification_index(const char* id) {
@@ -1309,8 +1516,9 @@ static CGRect island_card_frame(struct island_layout* layout,
                                 CGFloat scroll_offset         ) {
   CGRect list = island_alerts_list(layout);
   CGFloat top = CGRectGetMaxY(list) - card->y + scroll_offset;
-  return (CGRect){{ list.origin.x, top - ISLAND_CARD_HEIGHT },
-                  { list.size.width, ISLAND_CARD_HEIGHT     }};
+  CGFloat height = island_card_height(&card->item);
+  return (CGRect){{ list.origin.x, top - height },
+                  { list.size.width, height     }};
 }
 
 static void island_draw_alerts(CGContextRef context,
@@ -1319,7 +1527,8 @@ static void island_draw_alerts(CGContextRef context,
   const struct notification_list* notifications = notifications_get();
   // Neither source readable: banners need Accessibility, Notification
   // Center's history Full Disk Access.
-  if (!notifications->trusted && !notifications->history) {
+  if (notifications_capture() && !notifications->trusted
+      && !notifications->history && notifications->count == 0) {
     island_draw_placeholder(context, layout,
                             "Allow SketchyBar in Accessibility");
     return;
@@ -2406,15 +2615,19 @@ static struct island_claude_layout island_get_claude_layout(
   struct island_claude_layout c;
   c.page = island_page_rect(layout);
   CGFloat top = CGRectGetMaxY(c.page);
-  c.tabs = (CGRect){{ c.page.origin.x, top - ISLAND_CLAUDE_TABS },
-                    { c.page.size.width, ISLAND_CLAUDE_TABS }};
+  // Without the Top models plugin there is nothing to switch to: no
+  // segmented control, the sessions take the whole page.
+  CGFloat tabs = claude_plugin(CLAUDE_PLUGIN_MODELS) ? ISLAND_CLAUDE_TABS : 0;
+  c.tabs = (CGRect){{ c.page.origin.x, top - tabs },
+                    { c.page.size.width, tabs }};
   CGFloat half = floor(c.page.size.width / 2.0);
-  c.tab[0] = (CGRect){ c.tabs.origin, { half, ISLAND_CLAUDE_TABS } };
+  c.tab[0] = (CGRect){ c.tabs.origin, { half, tabs } };
   c.tab[1] = (CGRect){{ c.tabs.origin.x + half, c.tabs.origin.y },
-                      { c.tabs.size.width - half, ISLAND_CLAUDE_TABS }};
+                      { c.tabs.size.width - half, tabs }};
   c.content = (CGRect){{ c.page.origin.x, c.page.origin.y },
                        { c.page.size.width,
-                         c.tabs.origin.y - 5 - c.page.origin.y }};
+                         c.tabs.origin.y - (tabs > 0 ? 5 : 0)
+                         - c.page.origin.y                    }};
   c.track = (CGRect){{ CGRectGetMaxX(c.content) - ISLAND_SCROLL_WIDTH,
                        c.content.origin.y                             },
                      { ISLAND_SCROLL_WIDTH, c.content.size.height }};
@@ -2710,7 +2923,12 @@ static void island_draw_claude(CGContextRef context,
     return;
   }
 
-  island_draw_claude_tabs(context, island, &c);
+  if (!claude_plugin(CLAUDE_PLUGIN_MODELS)) {
+    island->claude_subtab = island->claude_previous_subtab
+                          = ISLAND_CLAUDE_SESSIONS;
+  } else {
+    island_draw_claude_tabs(context, island, &c);
+  }
 
   CGContextSaveGState(context);
   CGContextClipToRect(context, c.content);
@@ -3179,6 +3397,18 @@ bool island_handle_click(struct island* island,
       if (index < 0) return true;
       // The close button only marks it read; the rest opens the app.
       CGRect frame = island_card_frame(&layout, card, island->scroll_offset);
+      if (claude_suggestion_active(&card->item)) {
+        CGRect yes, no;
+        island_card_choices(frame, &yes, &no);
+        if (CGRectContainsPoint(CGRectInset(yes, -3, -2), point)
+            || CGRectContainsPoint(CGRectInset(no, -3, -2), point)) {
+          action->type = CGRectContainsPoint(CGRectInset(yes, -3, -2), point)
+                         ? ISLAND_ACTION_SUGGESTION_YES
+                         : ISLAND_ACTION_SUGGESTION_NO;
+          action->index = index;
+          return true;
+        }
+      }
       bool close = CGRectContainsPoint(
                      CGRectInset(island_card_close_rect(frame), -4, -4),
                      point                                           );
@@ -3274,6 +3504,70 @@ void island_draw_peek(CGContextRef context,
   island_draw_text(context, text, g_fonts.peek, 0.95,
                    text_rect.origin.x, baseline,
                    text_rect.size.width + 1, ALIGN_LEFT);
+  CGContextRestoreGState(context);
+}
+
+// Suggestion peek: one line in the peek font when it fits
+// ISLAND_SUGGEST_LINE, else two balanced lines in the smaller font.
+static bool island_suggestion_two_lines(const char* text) {
+  return island_text_width(text, g_fonts.peek) > ISLAND_SUGGEST_LINE;
+}
+
+static CGFloat island_suggestion_wrap_width(const char* text) {
+  CGFloat full = island_text_width(text, g_fonts.peek_small);
+  return min(ceil(full / 2.0) + 30, ISLAND_SUGGEST_LINE);
+}
+
+CGFloat island_suggestion_text_width(const char* text) {
+  if (!g_loaded || !text) return 0;
+  if (!island_suggestion_two_lines(text))
+    return island_text_width(text, g_fonts.peek);
+  return island_suggestion_wrap_width(text);
+}
+
+void island_split_choices(CGRect area, CGRect* yes, CGRect* no) {
+  CGFloat y = CGRectGetMidY(area) - ISLAND_CHOICE_HEIGHT / 2.0;
+  CGFloat x = CGRectGetMaxX(area) - ISLAND_CHOICES_WIDTH;
+  *yes = (CGRect){{ x, y }, { ISLAND_CHOICE_WIDTH, ISLAND_CHOICE_HEIGHT }};
+  *no = (CGRect){{ x + ISLAND_CHOICE_WIDTH + ISLAND_CHOICE_GAP, y },
+                 { ISLAND_CHOICE_WIDTH, ISLAND_CHOICE_HEIGHT }};
+}
+
+void island_draw_suggestion_peek(CGContextRef context,
+                                 const struct notification_item* item,
+                                 CGRect choices,
+                                 CGRect text_rect,
+                                 double alpha                        ) {
+  if (!g_loaded || alpha <= 0) return;
+  alpha = max(min(alpha, 1.0), 0.0);
+  CGContextSaveGState(context);
+  CGContextSetAlpha(context, alpha);
+
+  CGRect yes, no;
+  island_split_choices(choices, &yes, &no);
+  island_draw_choice(context, yes, true, 1.0);
+  island_draw_choice(context, no, false, 1.0);
+
+  const char* text = item->suggestion;
+  if (!island_suggestion_two_lines(text)) {
+    CGFloat baseline = CGRectGetMidY(text_rect)
+                       - (CTFontGetAscent(g_fonts.peek)
+                          - CTFontGetDescent(g_fonts.peek)) / 2.0;
+    island_draw_text(context, text, g_fonts.peek, 0.95, text_rect.origin.x,
+                     baseline, text_rect.size.width + 1, ALIGN_LEFT       );
+  } else {
+    CTLineRef lines[2];
+    int count = island_wrap_text(text, g_fonts.peek_small,
+                                 island_suggestion_wrap_width(text) + 1,
+                                 2, lines                              );
+    CGFloat spacing = 13;
+    CGFloat offset = (CTFontGetAscent(g_fonts.peek_small)
+                      - CTFontGetDescent(g_fonts.peek_small)) / 2.0;
+    CGFloat first = CGRectGetMidY(text_rect) + spacing * (count - 1) / 2.0
+                    - offset;
+    island_draw_lines(context, lines, count, ISLAND_COLOR_WHITE, 0.95,
+                      text_rect.origin.x, first, spacing              );
+  }
   CGContextRestoreGState(context);
 }
 

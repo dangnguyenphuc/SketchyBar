@@ -130,6 +130,12 @@
 #define PROPERTY_CLAUDE_CHECK_INTERVAL         "claude_check_interval"
 #define PROPERTY_CLAUDE_MODELS_SCRIPT          "claude_models_script"
 #define PROPERTY_CLAUDE_MODELS_FILE            "claude_models_file"
+#define PROPERTY_CLAUDE_SUGGEST_DURATION       "claude_suggest_duration"
+#define PROPERTY_PLUGIN_NOTIFICATIONS          "plugin_notifications"
+#define PROPERTY_PLUGIN_CLAUDE                 "plugin_claude"
+#define PROPERTY_PLUGIN_CLAUDE_NOTIFICATIONS   "plugin_claude_notifications"
+#define PROPERTY_PLUGIN_CLAUDE_SUGGESTIONS     "plugin_claude_suggestions"
+#define PROPERTY_PLUGIN_CLAUDE_MODELS          "plugin_claude_models"
 #define PROPERTY_HORIZONTAL                    "horizontal"
 
 #define DOMAIN_SUBSCRIBE                       "--subscribe"
